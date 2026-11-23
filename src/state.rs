@@ -13,12 +13,13 @@ use std::{
 };
 
 use smithay::{
-    backend::renderer::utils::{
-        CommitCounter, on_commit_buffer_handler, with_renderer_surface_state,
+    backend::renderer::{
+        buffer_dimensions,
+        utils::{CommitCounter, on_commit_buffer_handler, with_renderer_surface_state},
     },
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Space,
-        Window, find_popup_root_surface,
+        Window, find_popup_root_surface, utils::send_frames_surface_tree,
     },
     input::{
         Seat, SeatHandler, SeatState,
@@ -80,9 +81,9 @@ use crate::{
     error::Error,
     event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
     frame_clock::{FRAME_INTERVAL, FrameClock},
-    handle::{Command, Reply},
+    handle::{Command, Outcome, Reply},
     input::TextInputTracker,
-    output::{DEFAULT_OUTPUT, OutputSpec, VirtualOutputs, apply_scale_hints},
+    output::{VirtualOutputs, apply_scale_hints, default_output_spec},
     render,
 };
 
@@ -123,8 +124,6 @@ pub(crate) struct WindowRecord {
 struct PopupRecord {
     surface_id: SurfaceId,
     surface: WlSurface,
-    /// The toplevel window it anchors to, when mapped under one.
-    window_id: Option<WindowId>,
 }
 
 /// The compositor state owned by the event-loop thread.
@@ -211,19 +210,8 @@ impl ScryState {
     ) -> Self {
         let mut space = Space::default();
         let mut outputs = VirtualOutputs::new();
-        let (name, size, refresh, scale, position) = DEFAULT_OUTPUT;
         outputs
-            .update(
-                dh,
-                &mut space,
-                OutputSpec {
-                    name: name.to_string(),
-                    size,
-                    refresh_millihertz: refresh,
-                    scale,
-                    position,
-                },
-            )
+            .update(dh, &mut space, default_output_spec())
             .expect("default output spec must be valid");
 
         // The seat needs a keyboard for clients to own selections: smithay
@@ -316,10 +304,26 @@ impl ScryState {
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
     }
 
+    /// Answers a mutating command: a successful outcome is stamped with a
+    /// fresh sequence number; errors travel back unmodified.
+    fn send_mutating_reply<T>(
+        &mut self,
+        reply: &ReplySender<Outcome<T>>,
+        outcome: crate::Result<T>,
+    ) {
+        let _ = reply.send(outcome.map(|value| {
+            self.seq += 1;
+            Reply {
+                seq: self.seq,
+                value,
+            }
+        }));
+    }
+
     /// Recomputes the externally visible metadata of a mapped window.
     fn window_info(&self, id: WindowId, window: &Window) -> WindowInfo {
         let toplevel = window.toplevel();
-        let (title, app_id, activated) = toplevel
+        let (title, app_id, activated, maximized) = toplevel
             .map(|toplevel| {
                 let (title, app_id) = with_states(toplevel.wl_surface(), |states| {
                     let attributes = states
@@ -330,13 +334,29 @@ impl ScryState {
                         .unwrap();
                     (attributes.title.clone(), attributes.app_id.clone())
                 });
-                let activated = toplevel
-                    .current_state()
-                    .states
-                    .contains(xdg_toplevel::State::Activated);
-                (title, app_id, activated)
+                let states = toplevel.current_state().states;
+                (
+                    title,
+                    app_id,
+                    states.contains(xdg_toplevel::State::Activated),
+                    states.contains(xdg_toplevel::State::Maximized),
+                )
             })
-            .unwrap_or((None, None, false));
+            .unwrap_or((None, None, false, false));
+
+        // Every `wl_surface` is stamped with a `SurfaceId` at creation.
+        let surface_id = toplevel
+            .and_then(|t| self.surface_id_for(t.wl_surface()))
+            .expect("toplevel surface without a SurfaceId");
+
+        let buffer_size = toplevel
+            .and_then(|t| {
+                with_renderer_surface_state(t.wl_surface(), |rss| {
+                    rss.buffer().and_then(|buffer| buffer_dimensions(buffer))
+                })
+                .flatten()
+            })
+            .map(|size| (size.w, size.h));
 
         let pid = toplevel
             .and_then(|t| t.wl_surface().client())
@@ -354,11 +374,14 @@ impl ScryState {
 
         WindowInfo {
             id,
+            surface_id,
             app_id,
             title,
             geometry,
+            buffer_size,
             pid,
             activated,
+            maximized,
             scale: self.outputs.preferred_scale_for(&self.space, window),
         }
     }
@@ -553,7 +576,6 @@ impl ScryState {
                 self.mapped_popups.push(PopupRecord {
                     surface_id,
                     surface: surface.clone(),
-                    window_id: popup.window_id,
                 });
                 self.emit(|seq| CompositorEvent::PopupMapped { seq, popup });
             }
@@ -656,13 +678,7 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_pointer_motion(target, x, y);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::PointerButton {
                 button,
@@ -670,23 +686,11 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_pointer_button(button, pressed);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::PointerScroll { x, y, reply } => {
                 let outcome = self.cmd_pointer_scroll(x, y);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::KeyEvent {
                 name,
@@ -694,13 +698,7 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_key_event(&name, pressed);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::KeyCombo {
                 name,
@@ -708,33 +706,15 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_key_combo(&name, &modifiers);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::TypeText { text, reply } => {
                 let outcome = self.cmd_type_text(&text);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::FocusWindow { id, reply } => {
                 let outcome = self.cmd_focus_window(id);
-                let _ = reply.send(outcome.map(|value| {
-                    self.seq += 1;
-                    Reply {
-                        seq: self.seq,
-                        value,
-                    }
-                }));
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::Shutdown { reply } => {
                 let _ = reply.send(Ok(Reply {
@@ -757,40 +737,41 @@ impl ScryState {
                     value: windows,
                 }));
             }
+            Command::Popups { reply } => {
+                let popups = self
+                    .mapped_popups
+                    .iter()
+                    .map(|record| self.popup_info(record.surface_id, &record.surface))
+                    .collect();
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: popups,
+                }));
+            }
             Command::ResizeWindow { id, size, reply } => {
-                let found = self.windows.iter().find(|record| record.id == id);
-                match found.and_then(|record| record.window.toplevel()) {
-                    Some(toplevel) => {
+                let outcome = self
+                    .windows
+                    .iter()
+                    .find(|record| record.id == id)
+                    .and_then(|record| record.window.toplevel())
+                    .ok_or(Error::UnknownWindow(id))
+                    .map(|toplevel| {
                         toplevel.with_pending_state(|state| {
                             state.size = Some(Size::from(size));
                         });
                         toplevel.send_configure();
-                        self.seq += 1;
-                        let _ = reply.send(Ok(Reply {
-                            seq: self.seq,
-                            value: (),
-                        }));
-                    }
-                    None => {
-                        let _ = reply.send(Err(Error::UnknownWindow(id)));
-                    }
-                }
+                    });
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::CloseWindow { id, reply } => {
-                let found = self.windows.iter().find(|record| record.id == id);
-                match found.and_then(|record| record.window.toplevel()) {
-                    Some(toplevel) => {
-                        toplevel.send_close();
-                        self.seq += 1;
-                        let _ = reply.send(Ok(Reply {
-                            seq: self.seq,
-                            value: (),
-                        }));
-                    }
-                    None => {
-                        let _ = reply.send(Err(Error::UnknownWindow(id)));
-                    }
-                }
+                let outcome = self
+                    .windows
+                    .iter()
+                    .find(|record| record.id == id)
+                    .and_then(|record| record.window.toplevel())
+                    .ok_or(Error::UnknownWindow(id))
+                    .map(|toplevel| toplevel.send_close());
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::CaptureWindow { id, reply } => {
                 let outcome = self
@@ -829,36 +810,18 @@ impl ScryState {
             Command::UpdateOutput { spec, reply } => {
                 let outcome = self
                     .outputs
-                    .update(&self.display_handle, &mut self.space, spec)
-                    .map(|()| {
-                        self.seq += 1;
-                        Reply {
-                            seq: self.seq,
-                            value: (),
-                        }
-                    });
-                let _ = reply.send(outcome);
+                    .update(&self.display_handle, &mut self.space, spec);
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::RemoveOutput { name, reply } => {
                 let outcome = self
                     .outputs
-                    .remove(&self.display_handle, &mut self.space, &name)
-                    .map(|()| {
-                        self.seq += 1;
-                        Reply {
-                            seq: self.seq,
-                            value: (),
-                        }
-                    });
-                let _ = reply.send(outcome);
+                    .remove(&self.display_handle, &mut self.space, &name);
+                self.send_mutating_reply(&reply, outcome);
             }
             Command::SetFrameClockMode { mode, reply } => {
                 self.frame_clock.set_mode(mode);
-                self.seq += 1;
-                let _ = reply.send(Ok(Reply {
-                    seq: self.seq,
-                    value: (),
-                }));
+                self.send_mutating_reply(&reply, Ok(()));
             }
             Command::SetSelection {
                 kind,
@@ -877,11 +840,7 @@ impl ScryState {
             Command::StepFrameClock { duration, reply } => {
                 let time = self.frame_clock.step(duration);
                 self.send_frames(time);
-                self.seq += 1;
-                let _ = reply.send(Ok(Reply {
-                    seq: self.seq,
-                    value: (),
-                }));
+                self.send_mutating_reply(&reply, Ok(()));
             }
             Command::ClearSelection { kind, reply } => {
                 self.clear_selection(kind);
@@ -924,6 +883,21 @@ impl ScryState {
                 .send_frame(&primary, time, Some(Duration::ZERO), |_, _| {
                     Some(primary.clone())
                 });
+            // `Window::send_frame` covers the toplevel's surface tree;
+            // popups anchored to it are separate trees needing their own
+            // traversal so `wl_surface.frame` on popups fires too. (The
+            // second pass is idempotent: pending callbacks are drained.)
+            if let Some(root) = record.window.wl_surface() {
+                for (popup, _) in PopupManager::popups_for_surface(&root) {
+                    send_frames_surface_tree(
+                        popup.wl_surface(),
+                        &primary,
+                        time,
+                        Some(Duration::ZERO),
+                        |_, _| Some(primary.clone()),
+                    );
+                }
+            }
         }
         // Frame callbacks are protocol traffic; flush so clients observe
         // them promptly rather than on the next unrelated dispatch.
@@ -965,34 +939,17 @@ impl ScryState {
     /// window (or a popup's anchor window). Unmapped surfaces get the
     /// primary output's scale.
     fn scale_for_surface(&self, surface: &WlSurface) -> f64 {
-        let mut root = surface.clone();
-        while let Some(parent) = get_parent(&root) {
-            root = parent;
-        }
-        for record in &self.windows {
-            if record
-                .window
-                .wl_surface()
-                .map(|s| *s == root)
-                .unwrap_or(false)
-            {
-                return self
-                    .outputs
-                    .preferred_scale_for(&self.space, &record.window);
-            }
-        }
-        if let Some(window_id) = self
-            .mapped_popups
+        let Some(window_id) = self.window_id_for_surface(surface) else {
+            return self.outputs.primary_scale();
+        };
+        self.windows
             .iter()
-            .find(|record| record.surface == *surface)
-            .and_then(|record| record.window_id)
-            && let Some(record) = self.windows.iter().find(|record| record.id == window_id)
-        {
-            return self
-                .outputs
-                .preferred_scale_for(&self.space, &record.window);
-        }
-        self.outputs.primary_scale()
+            .find(|record| record.id == window_id)
+            .map(|record| {
+                self.outputs
+                    .preferred_scale_for(&self.space, &record.window)
+            })
+            .unwrap_or_else(|| self.outputs.primary_scale())
     }
 
     /// Bookkeeping run after every event-loop dispatch.
@@ -1115,6 +1072,48 @@ impl XdgShellHandler for ScryState {
         });
         surface.send_repositioned(token);
         let _ = surface.send_configure();
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        // Fill the output the window overlaps, falling back to the primary
+        // output when it overlaps none.
+        let output = self
+            .windows
+            .iter()
+            .find(|record| {
+                record
+                    .window
+                    .toplevel()
+                    .map(|toplevel| *toplevel.wl_surface() == *surface.wl_surface())
+                    .unwrap_or(false)
+            })
+            .and_then(|record| {
+                self.space
+                    .outputs_for_element(&record.window)
+                    .into_iter()
+                    .next()
+            })
+            .or_else(|| self.outputs.primary().cloned());
+        let size = output.and_then(|output| {
+            self.space
+                .output_geometry(&output)
+                .map(|geometry| geometry.size)
+        });
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Maximized);
+            state.size = size;
+        });
+        surface.send_configure();
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        // Restore client-controlled sizing: clear the state and drop the
+        // size constraint so the client picks its own dimensions again.
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Maximized);
+            state.size = None;
+        });
+        surface.send_configure();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {

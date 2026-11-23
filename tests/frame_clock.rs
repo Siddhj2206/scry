@@ -139,3 +139,55 @@ fn resuming_realtime_mode_fires_held_callbacks_again() {
         .expect("resume failed");
     client.pump_until(|s| !s.frame_times.is_empty());
 }
+
+/// `wl_surface.frame` requested on a mapped `xdg_popup` follows the same
+/// virtual clock rules as toplevels: held while paused, released by `step`.
+#[test]
+fn paused_clock_holds_and_releases_popup_frame_callbacks() {
+    use wayland_protocols::xdg::shell::client::xdg_positioner;
+
+    let compositor = Compositor::spawn().unwrap();
+    let handle = compositor.handle().clone();
+    handle
+        .set_frame_clock_mode(FrameClockMode::Paused)
+        .expect("pause failed");
+
+    let mut client = TestClient::connect(handle.socket_path());
+    let toplevel = client.map_toplevel(64, 64, "org.scry.FramePopup", "popup frames");
+
+    // Map a small popup anchored to the toplevel.
+    let positioner = client.wm_base.create_positioner(&client.qh, ());
+    positioner.set_size(16, 16);
+    positioner.set_anchor_rect(0, 0, 1, 1);
+    positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+    positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+    let popup_surface = client.compositor.create_surface(&client.qh, ());
+    let popup_xsurface = client
+        .wm_base
+        .get_xdg_surface(&popup_surface, &client.qh, ());
+    let _popup = popup_xsurface.get_popup(Some(&toplevel.xsurface), &positioner, &client.qh, ());
+    positioner.destroy();
+    client.pump_until(|s| !s.popup_configures.is_empty());
+    let popup_buffer = client.shm_buffer(16, 16, 0xffaa_bbcc);
+    popup_surface.attach(Some(&popup_buffer), 0, 0);
+    popup_surface.commit();
+    client.roundtrip();
+
+    // A frame request on the popup's surface is held while the clock is
+    // paused; roundtrips prove nothing arrives early.
+    popup_surface.frame(&client.qh, 0);
+    popup_surface.commit();
+    for _ in 0..3 {
+        client.roundtrip();
+    }
+    assert!(
+        client.state.frame_times.is_empty(),
+        "paused clock must hold popup frame callbacks"
+    );
+
+    // Stepping advances the clock and releases the held popup callback.
+    handle
+        .step_frame_clock(Duration::from_millis(16))
+        .expect("step failed");
+    client.pump_until(|s| !s.frame_times.is_empty());
+}

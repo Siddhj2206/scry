@@ -371,6 +371,10 @@ fn popup_maps_composites_and_closes_with_events() {
         }
     );
 
+    // The queryable popup list snapshots the same metadata.
+    let reply = handle.popups().expect("popups query failed");
+    assert_eq!(reply.value, vec![info.clone()]);
+
     // The window capture now includes the popup at its position.
     let frame = handle.capture_window(window.id).expect("capture").value;
     assert_eq!((frame.width, frame.height), (32, 36));
@@ -387,6 +391,10 @@ fn popup_maps_composites_and_closes_with_events() {
         unreachable!()
     };
     assert_eq!(surface_id, info.surface_id);
+    assert!(
+        handle.popups().unwrap().value.is_empty(),
+        "closed popup must leave the popup list"
+    );
 
     let _ = popup_xsurface;
     let _ = popup_surface;

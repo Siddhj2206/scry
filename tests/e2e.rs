@@ -13,8 +13,6 @@
 //! suite runs both on developer hosts and in the `Containerfile` `e2e` stage.
 //! All synchronization is event- or EOF-driven — no `sleep()` anywhere.
 
-mod common;
-
 use std::{
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},

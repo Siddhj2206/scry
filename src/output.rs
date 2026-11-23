@@ -26,8 +26,15 @@ use crate::{error::Error, event::Rect};
 
 /// The output every compositor starts with: `Virtual-1`, 1920x1080 @ 60Hz,
 /// scale 1 at the space origin.
-pub(crate) const DEFAULT_OUTPUT: (&str, (i32, i32), i32, f64, (i32, i32)) =
-    ("Virtual-1", (1920, 1080), 60_000, 1.0, (0, 0));
+pub(crate) fn default_output_spec() -> OutputSpec {
+    OutputSpec {
+        name: "Virtual-1".to_string(),
+        size: (1920, 1080),
+        refresh_millihertz: 60_000,
+        scale: 1.0,
+        position: (0, 0),
+    }
+}
 
 /// Configuration of a virtual `wl_output`, supplied by callers.
 ///

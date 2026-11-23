@@ -25,6 +25,10 @@ fn toplevel_map_emits_window_mapped_with_metadata_and_pid() {
     assert_eq!(window.app_id.as_deref(), Some("org.scry.Test"));
     assert_eq!(window.title.as_deref(), Some("Test Window"));
     assert_eq!(window.pid, Some(std::process::id()));
+    // The initial commit attached a 640x480 buffer; the window is not
+    // maximized and `surface_id` identifies its root wl_surface.
+    assert_eq!(window.buffer_size, Some((640, 480)));
+    assert!(!window.maximized);
     assert_eq!(
         window.geometry,
         Rect {
@@ -41,6 +45,8 @@ fn toplevel_map_emits_window_mapped_with_metadata_and_pid() {
     assert_eq!(reply.value.len(), 1);
     assert_eq!(reply.value[0].id, window.id);
     assert_eq!(reply.value[0].app_id.as_deref(), Some("org.scry.Test"));
+    assert_eq!(reply.value[0].surface_id, window.surface_id);
+    assert_eq!(reply.value[0].buffer_size, Some((640, 480)));
 }
 
 #[test]
@@ -68,6 +74,7 @@ fn shm_commit_emits_surface_committed_with_normalized_damage() {
     );
     let CompositorEvent::SurfaceCommitted {
         seq,
+        surface_id,
         window_id,
         damage,
         ..
@@ -76,6 +83,8 @@ fn shm_commit_emits_surface_committed_with_normalized_damage() {
         unreachable!()
     };
     assert_eq!(window_id, Some(window.id));
+    // The committing surface is the window's root wl_surface.
+    assert_eq!(surface_id, window.surface_id);
     assert_eq!(
         damage,
         vec![Rect {
@@ -292,4 +301,102 @@ fn command_replies_carry_sequence_numbers() {
         "mutating command applied at seq >= last known"
     );
     assert!(r3.seq >= r2.seq);
+}
+
+/// `xdg_toplevel.set_maximized`/`unset_maximized` drive compositor
+/// configures: maximize resizes to the primary output's logical size,
+/// unmaximize clears the state and the size constraint.
+#[test]
+fn maximize_requests_reconfigure_and_update_window_info() {
+    use wayland_protocols::xdg::shell::client::xdg_toplevel;
+    const MAXIMIZED: u32 = xdg_toplevel::State::Maximized as u32;
+
+    let compositor = Compositor::spawn().unwrap();
+    let handle = compositor.handle().clone();
+    let events = handle.subscribe().unwrap();
+
+    let mut client = TestClient::connect(handle.socket_path());
+    let toplevel = client.map_toplevel(100, 100, "org.scry.Max", "Max");
+
+    let mapped = wait_for_event(&events, |e| {
+        matches!(e, CompositorEvent::WindowMapped { .. })
+    });
+    let CompositorEvent::WindowMapped { window, .. } = mapped else {
+        unreachable!()
+    };
+    let id = window.id;
+    assert!(!window.maximized);
+
+    // Maximize: the compositor configures the toplevel with the Maximized
+    // state and the primary output's logical size (Virtual-1 = 1920x1080).
+    let configures_before = client.state.toplevel_configures.len();
+    toplevel.toplevel.set_maximized();
+    client.pump_until(|s| s.toplevel_configures.len() > configures_before);
+    assert_eq!(client.state.toplevel_configures.back(), Some(&(1920, 1080)));
+    assert!(
+        client
+            .state
+            .toplevel_states
+            .back()
+            .is_some_and(|states| states.contains(&MAXIMIZED))
+    );
+
+    // Recommit at the negotiated size: the committed state flows through
+    // WindowUpdated and the window list.
+    let buf = client.shm_buffer(1920, 1080, 0xff22_4466);
+    toplevel.surface.attach(Some(&buf), 0, 0);
+    toplevel.surface.commit();
+    client.roundtrip();
+
+    let ev = wait_for_event(
+        &events,
+        |e| matches!(e, CompositorEvent::WindowUpdated { window: w, .. } if w.id == id && w.maximized),
+    );
+    let CompositorEvent::WindowUpdated { window: w, .. } = ev else {
+        unreachable!()
+    };
+    assert_eq!((w.geometry.width, w.geometry.height), (1920, 1080));
+    assert_eq!(w.buffer_size, Some((1920, 1080)));
+
+    let info = handle
+        .windows()
+        .unwrap()
+        .value
+        .into_iter()
+        .find(|w| w.id == id)
+        .unwrap();
+    assert!(info.maximized);
+
+    // Unmaximize: Maximized is cleared and the size constraint dropped
+    // (0x0 lets the client choose its own size again).
+    let configures_before = client.state.toplevel_configures.len();
+    toplevel.toplevel.unset_maximized();
+    client.pump_until(|s| s.toplevel_configures.len() > configures_before);
+    assert_eq!(client.state.toplevel_configures.back(), Some(&(0, 0)));
+    assert!(
+        client
+            .state
+            .toplevel_states
+            .back()
+            .is_some_and(|states| !states.contains(&MAXIMIZED))
+    );
+
+    let buf = client.shm_buffer(120, 90, 0xff33_5577);
+    toplevel.surface.attach(Some(&buf), 0, 0);
+    toplevel.surface.commit();
+    client.roundtrip();
+
+    wait_for_event(
+        &events,
+        |e| matches!(e, CompositorEvent::WindowUpdated { window: w, .. } if w.id == id && !w.maximized),
+    );
+    let info = handle
+        .windows()
+        .unwrap()
+        .value
+        .into_iter()
+        .find(|w| w.id == id)
+        .unwrap();
+    assert!(!info.maximized);
+    assert_eq!(info.buffer_size, Some((120, 90)));
 }

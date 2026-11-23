@@ -53,16 +53,23 @@ pub struct SurfaceId(pub u64);
 pub struct WindowInfo {
     /// Stable identifier for the lifetime of the mapping.
     pub id: WindowId,
+    /// Identifier of the window's root `wl_surface`.
+    pub surface_id: SurfaceId,
     /// `xdg_toplevel.app_id`, if the client set one.
     pub app_id: Option<String>,
     /// `xdg_toplevel.title`, if the client set one.
     pub title: Option<String>,
     /// Window geometry in logical compositor-space coordinates.
     pub geometry: Rect,
+    /// Pixel dimensions of the buffer currently attached to the window's
+    /// root surface, if any.
+    pub buffer_size: Option<(i32, i32)>,
     /// `SO_PEERCRED` pid of the client that owns this window.
     pub pid: Option<u32>,
     /// Whether the toplevel currently carries the `activated` state.
     pub activated: bool,
+    /// Whether the toplevel currently carries the `maximized` state.
+    pub maximized: bool,
     /// The scale factor advertised to this window's surfaces: the highest
     /// scale of the virtual outputs it overlaps. This is the value reported
     /// through `wp_fractional_scale_v1` / `preferred_buffer_scale`.

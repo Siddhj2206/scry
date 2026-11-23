@@ -112,6 +112,9 @@ pub struct ClientState {
     pub shm_formats: Vec<wl_shm::Format>,
     pub configure_serials: VecDeque<u32>,
     pub toplevel_configures: VecDeque<(i32, i32)>,
+    /// `xdg_toplevel.configure` state arrays (raw u32 enum values),
+    /// parallel to `toplevel_configures`.
+    pub toplevel_states: VecDeque<Vec<u32>>,
     pub close_requested: bool,
     pub outputs: Vec<String>,
     pub output_scales: Vec<i32>,
@@ -663,8 +666,21 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientState {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
                 state.toplevel_configures.push_back((width, height));
+                // The states array is a flat u32 blob on the wire.
+                state.toplevel_states.push_back(
+                    states
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_ne_bytes(*c))
+                        .collect(),
+                );
             }
             xdg_toplevel::Event::Close => state.close_requested = true,
             _ => {}

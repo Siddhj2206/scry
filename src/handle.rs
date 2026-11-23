@@ -16,7 +16,7 @@ use smithay::reexports::calloop::channel::Sender as CommandSender;
 use crate::{
     clipboard::SelectionKind,
     error::{Error, Result},
-    event::{CompositorEvent, Seq, WindowId, WindowInfo},
+    event::{CompositorEvent, PopupInfo, Seq, WindowId, WindowInfo},
     frame::Frame,
     frame_clock::FrameClockMode,
     input::{PointerButton, PointerTarget},
@@ -72,6 +72,10 @@ pub(crate) enum Command {
     /// Snapshot all currently mapped windows.
     Windows {
         reply: Sender<Outcome<Vec<WindowInfo>>>,
+    },
+    /// Snapshot all currently mapped popups.
+    Popups {
+        reply: Sender<Outcome<Vec<PopupInfo>>>,
     },
     /// Ask a toplevel to resize (xdg configure/ack roundtrip).
     ResizeWindow {
@@ -252,6 +256,12 @@ impl CompositorHandle {
     /// Lists all currently mapped toplevel windows.
     pub fn windows(&self) -> Result<Reply<Vec<WindowInfo>>> {
         self.request(|reply| Command::Windows { reply })
+    }
+
+    /// Lists all currently mapped `xdg_popup` surfaces, with the window
+    /// each is anchored to and its positioner geometry.
+    pub fn popups(&self) -> Result<Reply<Vec<PopupInfo>>> {
+        self.request(|reply| Command::Popups { reply })
     }
 
     /// Requests `xdg_toplevel` resize via the configure/ack lifecycle.
