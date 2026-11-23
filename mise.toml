@@ -34,5 +34,12 @@ run = "podman build --target e2e -t scry-e2e -f Containerfile ."
 [tasks.container-shell]
 run = "podman run --rm -it -v .:/workspace:Z -w /workspace scry-build bash"
 
+# CARGO_TARGET_DIR lives inside the container's /tmp: host checkouts may
+# symlink ./target elsewhere (e.g. shared caches), which would dangle in the
+# container.
+
 [tasks.container-test]
-run = "podman run --rm -v .:/workspace:Z -w /workspace scry-build cargo test"
+run = "podman run --rm -e CARGO_TARGET_DIR=/tmp/scry-target -v .:/workspace:Z -w /workspace scry-build cargo test"
+
+[tasks.container-test-e2e]
+run = "podman run --rm -e CARGO_TARGET_DIR=/tmp/scry-target -v .:/workspace:Z -w /workspace scry-e2e cargo test --test e2e -- --ignored --nocapture"

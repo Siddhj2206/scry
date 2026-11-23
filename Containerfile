@@ -47,4 +47,6 @@ RUN apt-get update \
         foot \
         zenity \
         wl-clipboard \
+        # foot fails to start without at least one font on the system.
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
