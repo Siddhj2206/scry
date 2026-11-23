@@ -50,9 +50,9 @@ pub mod code {
     pub const COMPOSITOR: i64 = -32008;
     /// Spawning or managing a workspace process failed.
     pub const PROCESS: i64 = -32009;
-    /// A tree `eN` ref no longer resolves: the node is gone, its role or
+    /// A `get_tree` ref no longer resolves: the node is gone, its role or
     /// exact name changed, or the snapshot it came from was evicted. The
-    /// caller should take a fresh `get_tree` snapshot.
+    /// caller must take a fresh `get_tree` snapshot.
     pub const STALE_REF: i64 = -32010;
 }
 

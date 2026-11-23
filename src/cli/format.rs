@@ -55,6 +55,10 @@ pub enum Verb {
     WaitForIdle,
     /// `get_tree`.
     GetTree,
+    /// `click_node`.
+    ClickNode,
+    /// `node_action`.
+    NodeAction,
     /// `get_changes_since`.
     GetChangesSince,
     /// `mark_set`.
@@ -97,6 +101,8 @@ impl Verb {
             Self::WaitForCommit => "wait_for_commit",
             Self::WaitForIdle => "wait_for_idle",
             Self::GetTree => "get_tree",
+            Self::ClickNode => "click_node",
+            Self::NodeAction => "node_action",
             Self::GetChangesSince => "get_changes_since",
             Self::MarkSet => "mark_set",
             Self::MarkList => "mark_list",
@@ -362,6 +368,23 @@ pub fn render(verb: Verb, r: &Value, outcome: &Outcome) -> String {
             format!("workspace idle after {}ms quiet{}", r["quiet_ms"], at)
         }
         Verb::GetTree => format_tree(r),
+        Verb::ClickNode => format!(
+            "clicked {} at ({},{}) x{} on {} (window {}){}",
+            r["button"],
+            r["x"],
+            r["y"],
+            r["clicked"],
+            r["ref"].as_str().unwrap_or("?"),
+            r["window"],
+            at,
+        ),
+        Verb::NodeAction => format!(
+            "performed {:?} on {} (window {}){}",
+            r["action"].as_str().unwrap_or("?"),
+            r["ref"].as_str().unwrap_or("?"),
+            r["window"],
+            at,
+        ),
         Verb::GetChangesSince => serde_json::to_string_pretty(r).unwrap_or_default(),
         Verb::MarkSet => {
             let mark = &r["mark"];

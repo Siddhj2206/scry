@@ -950,28 +950,36 @@ async fn subtree_capture(
         return Err(stale(None));
     };
 
-    // Resolve the ref's `(bus_name, object_path)` to an ObjectRef and
-    // re-check `(role, exact name)` on the live peer.
+    // Re-check the ref's `(role, exact name)` identity on the live peer
+    // — the same `verify_ref` check `click_node`/`node_action` run before
+    // acting; stale refs fail before any walking.
+    let live = verify_ref(
+        conn,
+        &RefTarget {
+            window_id: subtree.window_id,
+            bus_name: subtree.bus_name.clone(),
+            object_path: subtree.object_path.clone(),
+            role: subtree.role.clone(),
+            name: subtree.name.clone(),
+            bounds: subtree.anchor,
+        },
+    )
+    .await
+    .map_err(|err| stale(err.actual_role.zip(err.actual_name)))?;
+
+    // Resolve the ref's `(bus_name, object_path)` to an ObjectRef for the
+    // walk itself.
     let unique =
         zbus::names::UniqueName::try_from(subtree.bus_name.clone()).map_err(|_| stale(None))?;
     let path = zbus::zvariant::ObjectPath::try_from(subtree.object_path.clone())
         .map_err(|_| stale(None))?;
     let obj = ObjectRef::new_owned(unique.clone(), path);
-    let proxy = obj
-        .as_accessible_proxy(conn)
-        .await
-        .map_err(|_| stale(None))?;
-    let live_role = proxy.get_role().await.map_err(|_| stale(None))?;
-    let live_name = proxy.name().await.map_err(|_| stale(None))?;
-    if live_role.name() != subtree.role || live_name != subtree.name {
-        return Err(stale(Some((live_role.name().to_string(), live_name))));
-    }
 
     // Anchor on the bounds the snapshot recorded so re-walked coordinates
     // stay in absolute workspace space (zero delta when nothing moved).
     let delta = match subtree.anchor {
-        Some(anchor) => component_extents(conn, &obj)
-            .await
+        Some(anchor) => live
+            .extents
             .map(|e| (anchor.x - e.0, anchor.y - e.1))
             .unwrap_or((0, 0)),
         None => (0, 0),
@@ -983,7 +991,8 @@ async fn subtree_capture(
         .await
         .ok();
     let mut app_name = None;
-    if let Ok(app_ref) = proxy.get_application().await
+    if let Ok(proxy) = obj.as_accessible_proxy(conn).await
+        && let Ok(app_ref) = proxy.get_application().await
         && !app_ref.is_null()
         && let Ok(app_proxy) = app_ref.as_accessible_proxy(conn).await
     {
@@ -1316,15 +1325,112 @@ async fn component_extents(
     conn: &zbus::Connection,
     obj: &ObjectRefOwned,
 ) -> Option<(i32, i32, i32, i32)> {
-    let destination = BusName::try_from(obj.name_as_str()?).ok()?;
+    extents_at(conn, obj.name_as_str()?, obj.path().as_str()).await
+}
+
+/// `Component::GetExtents` in screen coordinates for the object at
+/// `(bus_name, path)` — the live-bounds refresh behind `click_node`'s
+/// fused-center computation.
+pub async fn extents_at(
+    conn: &zbus::Connection,
+    bus_name: &str,
+    path: &str,
+) -> Option<(i32, i32, i32, i32)> {
+    let destination = BusName::try_from(bus_name).ok()?;
+    let path = zbus::zvariant::ObjectPath::try_from(path).ok()?;
     let proxy = ComponentProxy::builder(conn)
         .destination(destination)
         .ok()?
-        .path(obj.path().clone())
+        .path(path)
         .ok()?
         .cache_properties(CacheProperties::No)
         .build()
         .await
         .ok()?;
     proxy.get_extents(CoordType::Screen).await.ok()
+}
+
+// -- staleness-checked refs (M3.4) ---------------------------------------------
+
+/// The live identity a staleness check re-read from the peer.
+#[derive(Debug)]
+pub struct LiveNode {
+    /// The node's current role name.
+    pub role: String,
+    /// The node's current exact name.
+    pub name: String,
+    /// Live screen-space extents when the node serves `Component`.
+    pub extents: Option<(i32, i32, i32, i32)>,
+    /// Whether the node lists `org.a11y.atspi.Action`.
+    pub has_action: bool,
+}
+
+/// A ref whose live identity no longer matches its snapshot — the
+/// `STALE_REF` payload for `click_node`/`node_action`.
+#[derive(Debug)]
+pub struct StaleRef {
+    /// `"missing"` (the node vanished or stopped answering) or the
+    /// identity field that changed (`"role"` / `"name"`).
+    pub mismatch: &'static str,
+    /// The node's live role, when it could still be read.
+    pub actual_role: Option<String>,
+    /// The node's live name, when it could still be read.
+    pub actual_name: Option<String>,
+    /// The underlying failure for `missing` mismatches.
+    pub detail: Option<String>,
+}
+
+/// Re-queries `target`'s live `(role, name)` at
+/// `(bus_name, object_path)` on `conn`: `Ok` means the ref is fresh and
+/// [`LiveNode`] carries current data for the action to use; `Err` is a
+/// stale ref — the node vanished or its identity drifted, and the
+/// caller must re-snapshot.
+pub async fn verify_ref(conn: &zbus::Connection, target: &RefTarget) -> Result<LiveNode, StaleRef> {
+    let missing = |detail: String| StaleRef {
+        mismatch: "missing",
+        actual_role: None,
+        actual_name: None,
+        detail: Some(detail),
+    };
+    let proxy = accessible_at(conn, &target.bus_name, &target.object_path)
+        .await
+        .map_err(|err| missing(format!("cannot reach the object: {err}")))?;
+    let role = proxy
+        .get_role()
+        .await
+        .map_err(|err| missing(format!("GetRole failed: {err}")))?
+        .name()
+        .to_string();
+    let name = proxy
+        .name()
+        .await
+        .map_err(|err| missing(format!("GetName failed: {err}")))?;
+    if role != target.role {
+        return Err(StaleRef {
+            mismatch: "role",
+            actual_role: Some(role),
+            actual_name: Some(name),
+            detail: None,
+        });
+    }
+    if name != target.name {
+        return Err(StaleRef {
+            mismatch: "name",
+            actual_role: Some(role),
+            actual_name: Some(name),
+            detail: None,
+        });
+    }
+    let interfaces = proxy.get_interfaces().await.unwrap_or_default();
+    let extents = if interfaces.contains(Interface::Component) {
+        extents_at(conn, &target.bus_name, &target.object_path).await
+    } else {
+        None
+    };
+    Ok(LiveNode {
+        role,
+        name,
+        extents,
+        has_action: interfaces.contains(Interface::Action),
+    })
 }

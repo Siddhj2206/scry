@@ -448,8 +448,9 @@ impl Workspace {
             .cloned()
     }
 
-    /// The most recent `get_tree` snapshot, if any — the snapshot
-    /// `get_tree`'s `root_ref` resolves against by default.
+    /// The newest retained `get_tree` snapshot — where `get_tree`'s
+    /// `root_ref`, `click_node` and `node_action` resolve refs when the
+    /// caller names no `snapshot`.
     pub fn latest_tree_snapshot(&self) -> Option<a11y::TreeSnapshot> {
         self.tree_snapshots
             .lock()
