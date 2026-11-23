@@ -24,6 +24,7 @@ pub mod a11y;
 pub mod bus;
 mod changelog;
 pub mod methods;
+pub mod portal;
 pub mod process;
 pub mod protocol;
 pub mod registry;

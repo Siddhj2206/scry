@@ -35,6 +35,9 @@ tokio = { version = "1", features = [
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# No `tokio` feature: `zbus::blocking` (used by integration tests and the
+# AT-SPI2 test peer) panics without a tokio reactor when it is enabled.
+# Async zbus inside the daemon's tokio runtime works fine on async-io.
 zbus = "5.5"
 
 [dev-dependencies]

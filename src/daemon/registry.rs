@@ -34,6 +34,7 @@ use crate::{
         bus::BusManager,
         changelog::{ChangeLog, Mark},
         now_ms,
+        portal::PortalManager,
         process::{ProcessInfo, ProcessRegistry, SpawnSpec},
         protocol::{ErrorResponse, code},
     },
@@ -163,6 +164,10 @@ pub struct Workspace {
     /// Bounded ring of `get_tree` snapshots — the state behind M3.4's
     /// staleness-checked refs and M3.5's `tree_diff`/`tree_find`.
     tree_snapshots: Mutex<a11y::SnapshotStore>,
+    /// The scripted XDG Desktop Portal stub on the session bus —
+    /// `org.freedesktop.portal.Desktop`, plus the control verbs'
+    /// scripting/history state.
+    portal: PortalManager,
     /// Bounded seq-indexed event log plus named marks — the state behind
     /// `get_changes_since`, `mark_set` and `mark_list`. Shared with the
     /// event-pump thread.
@@ -256,12 +261,18 @@ impl Workspace {
                 })?
         };
 
+        // With the session bus up, serve the scripted XDG Desktop
+        // Portal stub on it; a missing bus or failed claim degrades
+        // into the portal report, never the workspace.
+        let portal = PortalManager::start(&buses).await;
+
         let workspace = Self {
             meta_path: state_dir.join("workspaces").join(format!("{id}.json")),
             id,
             options,
             handle,
             buses,
+            portal,
             compositor: Mutex::new(Some(compositor)),
             pump: Mutex::new(Some(pump)),
             closing: CancellationToken::new(),
@@ -437,6 +448,12 @@ impl Workspace {
             .cloned()
     }
 
+    /// The workspace's scripted portal stub — scripting queue, invocation
+    /// history and health (`portal_*` verbs, `status`).
+    pub fn portal(&self) -> &PortalManager {
+        &self.portal
+    }
+
     /// Attaches a named mark to the workspace's seq timeline (`mark_set`).
     ///
     /// The mark occupies a fresh timeline point allocated on the
@@ -513,6 +530,7 @@ impl Workspace {
             "processes": self.processes.snapshot(),
             "active_waits": self.active_waits(),
             "bus": self.buses.report(),
+            "portal": self.portal.report(),
         })
     }
 
@@ -568,6 +586,7 @@ impl Workspace {
         // cleanly. The private bus daemons go down right after — before
         // the compositor's runtime dir (and their sockets) are removed.
         self.processes.terminate_all();
+        self.portal.stop();
         self.buses.terminate_all();
         let compositor = self
             .compositor
