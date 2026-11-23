@@ -4,3 +4,29 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "webp",
+] }
+signal-hook = "0.3"
+smithay = { version = "0.7", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+] }
+tempfile = "3"
+thiserror = "2"
+tiny-skia = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = [
+    "client",
+    "staging",
+    "unstable",
+] }
+
+[features]
+default = []
+renderer_pixman = ["smithay/renderer_pixman"]
