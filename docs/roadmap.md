@@ -92,7 +92,11 @@ takeover.
 
 **Deliverables**
 
-- Multi-workspace isolation with deterministic window placement
+- Multi-workspace isolation with deterministic window placement. Workspaces
+  are lightweight idempotent handles, not heavyweight shared sessions:
+  agent-chosen ids (e.g. `auth-flow`), options fixed at creation (`readOnly`,
+  `keepOpen`), persisted metadata, idle auto-cleanup, and `client_pid` tagging
+  so a dead client's in-flight work cancels cleanly.
 - Unix socket JSON-RPC API + `clap` CLI covering:
   - `workspace_create`, `output_add`
   - `spawn_app`, `list_windows`, `place_window`
@@ -101,6 +105,8 @@ takeover.
   - Targeted input: `click`, `drag`, `type_text`, `key_combo`,
     `clipboard_get` / `clipboard_set`
   - Event-driven waits: `wait_for_window`, `wait_for_commit`, `wait_for_idle`
+  - `status`: diagnostic verb narrating what is running, what is unhealthy,
+    and what to do next
 - Default Wayland + `wl_shm` + AT-SPI env profile injected by `spawn_app`
   (overridable): `GDK_BACKEND=wayland`, `GSK_RENDERER=cairo`,
   `QT_QPA_PLATFORM=wayland`, `MOZ_ENABLE_WAYLAND=1`,
@@ -108,6 +114,8 @@ takeover.
   `GTK_A11Y=atspi`, `ACCESSIBILITY_ENABLED=1`
 - `get_changes_since(seq)`: structured diffs for low-token agent observation
 - Command-id ↔ frame-seq acks plus named marks on the frame timeline
+- CLI and MCP server are thin, stateless proxies over a single daemon that
+  owns all state
 
 **Acceptance criteria**
 
@@ -128,6 +136,14 @@ takeover.
 - `click_node` and node-targeted actions
 - `SO_PEERCRED` PID ↔ D-Bus `GetConnectionUnixProcessID` correlation for exact
   multi-instance window↔tree fusion
+- Staleness-checked AT-SPI2 refs (`e12` = `(path, role, exact name)` triple):
+  a ref whose node changed or disappeared fails fast with a descriptive
+  re-snapshot hint
+- Bounded tree snapshots: depth, node-count, and deadline caps degrade
+  truncated subtrees to inline `- ... <reason>` notes
+- `ROLE_PASSWORD_TEXT` values redacted by default in every snapshot
+- Snapshot `find` (matching nodes with context lines) and LCS-based tree diffs
+  for low-token agent observation
 - Scripted XDG Desktop Portal stub (`FileChooser`, `OpenURI`) on the private
   session bus so agents/tests answer native file/URI dialogs deterministically
   instead of clicking a system picker
@@ -146,6 +162,9 @@ takeover.
 
 - `rmcp 3.11` server over stdio and streamable HTTP (`axum 0.8`)
 - Full Control API surface exposed as MCP tools for AI agents
+- Optional `clientInfo`-aware tool surface: typed tools for code-mode clients,
+  falling back to a compact `status` / `workspaces` / `execute` escape hatch
+  where a full typed surface does not fit
 
 **Acceptance criteria**
 
@@ -173,6 +192,10 @@ takeover.
     is rejected.
   - **Hand Back** — control returns to the agent together with a fresh state
     summary (windows, tree, recent actions) so it resumes with accurate context.
+- Blocking `handoff(reason)`: marks the workspace `WAIT` in the viewer and
+  resumes the agent only on an explicit human click.
+- `demonstrate` mode: records human clicks/typing in the live viewer into
+  replayable steps, coalescing typing and redacting passwords.
 - Acceptance: takeover is atomic, visible in the viewer, and every transition
   is logged; agent receives the state summary on hand-back.
 
@@ -185,6 +208,8 @@ takeover.
   failure artifacts.
 - Off-thread worker encoding so PNG/video encoding never stalls the
   compositor loop.
+- In-process Matroska/WebM muxing so video recording works without `ffmpeg`
+  at runtime (`ffmpeg` stays an optional encoder).
 - Acceptance: a recorded session replays deterministically; traces are small
   enough to attach to test failures.
 
