@@ -50,6 +50,10 @@ pub mod code {
     pub const COMPOSITOR: i64 = -32008;
     /// Spawning or managing a workspace process failed.
     pub const PROCESS: i64 = -32009;
+    /// A `get_tree` ref no longer matches the live accessible node
+    /// (vanished, or its role/name changed) — the caller must
+    /// re-snapshot.
+    pub const STALE_REF: i64 = -32010;
 }
 
 /// A decoded JSON-RPC request.

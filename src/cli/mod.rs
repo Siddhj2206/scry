@@ -107,6 +107,10 @@ enum Commands {
     Wait(WaitCommands),
     /// Fused compositor + AT-SPI2 accessibility tree snapshot.
     Tree(TreeArgs),
+    /// Click a fused accessibility node by its `eN` ref.
+    ClickNode(ClickNodeArgs),
+    /// Invoke an AT-SPI2 action on a fused node by its `eN` ref.
+    NodeAction(NodeActionArgs),
     /// Compact structured diff of everything that changed since a seq.
     Changes(ChangesArgs),
     /// Named marks on a workspace's seq timeline.
@@ -511,6 +515,49 @@ struct TreeArgs {
     #[arg(long)]
     window: Option<u64>,
     /// Bound the a11y capture in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct ClickNodeArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// The node's `eN` ref from `scry tree`.
+    #[arg(long = "ref", value_name = "REF")]
+    node_ref: String,
+    /// The snapshot the ref belongs to (default: the latest).
+    #[arg(long, value_name = "ID")]
+    snapshot: Option<u64>,
+    /// Button name (left/right/middle/side/extra/forward/back/task) or a
+    /// raw evdev button code (default left).
+    #[arg(long)]
+    button: Option<String>,
+    /// Press/release repetitions (1–64, default 1).
+    #[arg(long)]
+    count: Option<u32>,
+    /// Bound the a11y verification in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct NodeActionArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// The node's `eN` ref from `scry tree`.
+    #[arg(long = "ref", value_name = "REF")]
+    node_ref: String,
+    /// The snapshot the ref belongs to (default: the latest).
+    #[arg(long, value_name = "ID")]
+    snapshot: Option<u64>,
+    /// The action name (e.g. "click", "press", "toggle"); default: the
+    /// node's primary action.
+    #[arg(long)]
+    action: Option<String>,
+    /// Bound the a11y verification + invocation in milliseconds.
     #[arg(long, value_name = "MS")]
     deadline_ms: Option<u64>,
 }
@@ -974,6 +1021,37 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
                 params["deadline_ms"] = json!(ms);
             }
             (Verb::GetTree, params, Outcome::Default)
+        }
+        C::ClickNode(args) => {
+            let mut params = ws(&args.workspace);
+            params["ref"] = json!(args.node_ref);
+            if let Some(snapshot) = args.snapshot {
+                params["snapshot"] = json!(snapshot);
+            }
+            if let Some(button) = &args.button {
+                params["button"] = button_param(button);
+            }
+            if let Some(count) = args.count {
+                params["count"] = json!(count);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::ClickNode, params, Outcome::Default)
+        }
+        C::NodeAction(args) => {
+            let mut params = ws(&args.workspace);
+            params["ref"] = json!(args.node_ref);
+            if let Some(snapshot) = args.snapshot {
+                params["snapshot"] = json!(snapshot);
+            }
+            if let Some(action) = &args.action {
+                params["action"] = json!(action);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::NodeAction, params, Outcome::Default)
         }
         C::Changes(args) => (
             Verb::GetChangesSince,
