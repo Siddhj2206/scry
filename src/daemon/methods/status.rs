@@ -174,6 +174,25 @@ async fn workspace_entry(
         }
     }
 
+    // Portal stub health: with the session bus up but no portal serving,
+    // apps triggering file dialogs or URI launches hit ServiceUnknown.
+    // (A down session bus already reports itself above.)
+    let portal = &entry["portal"];
+    if portal["state"].as_str() != Some("running")
+        && bus["session"]["state"].as_str() == Some("running")
+    {
+        healthy = false;
+        let reason = portal["error"]
+            .as_str()
+            .unwrap_or("the portal stub is not serving");
+        unhealthy.push(format!(
+            "workspace {id:?}: XDG portal stub is not running ({reason})"
+        ));
+        next_steps.push(format!(
+            "close workspace {id:?} and recreate it to restart its portal stub"
+        ));
+    }
+
     // One compositor round-trip both proves responsiveness and yields the
     // output/window snapshot.
     let mut window_count = 0;

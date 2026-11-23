@@ -110,6 +110,12 @@ enum Commands {
     /// Named marks on a workspace's seq timeline.
     #[command(subcommand)]
     Mark(MarkCommands),
+    /// Queue a scripted response for the workspace portal stub.
+    PortalSet(PortalSetArgs),
+    /// Drop queued portal scripts (all, or one interface's).
+    PortalClear(PortalClearArgs),
+    /// List recorded portal invocations.
+    PortalHistory(PortalHistoryArgs),
     /// Diagnostic status of the daemon and its workspaces.
     Status(StatusArgs),
 }
@@ -513,6 +519,43 @@ struct MarkSetArgs {
     /// Arbitrary JSON metadata echoed back by diffs and mark list.
     #[arg(long, value_parser = parse_json)]
     metadata: Option<Value>,
+}
+
+#[derive(Args)]
+struct PortalSetArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Portal interface to script: "filechooser" or "openuri".
+    #[arg(long)]
+    interface: String,
+    /// The scripted response: "accept" (default), "cancel", "close",
+    /// or a raw code 0-2.
+    #[arg(long, value_name = "RESPONSE")]
+    response: Option<String>,
+    /// A file:// URI to return on accept (repeatable).
+    #[arg(long = "uri", value_name = "URI")]
+    uris: Vec<String>,
+}
+
+#[derive(Args)]
+struct PortalClearArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Only clear this interface's queue (default: all interfaces).
+    #[arg(long)]
+    interface: Option<String>,
+}
+
+#[derive(Args)]
+struct PortalHistoryArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Only return the newest N invocations.
+    #[arg(long, value_name = "N")]
+    limit: Option<u64>,
 }
 
 #[derive(Args)]
@@ -922,6 +965,36 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
         }
         C::Mark(MarkCommands::List(args)) => {
             (Verb::MarkList, ws(&args.workspace), Outcome::Default)
+        }
+        C::PortalSet(args) => {
+            let mut params = ws(&args.workspace);
+            params["interface"] = json!(args.interface);
+            if let Some(response) = &args.response {
+                // A bare number goes out as the raw code; names pass
+                // through for the daemon to resolve.
+                params["response"] = match response.parse::<u32>() {
+                    Ok(code) => json!(code),
+                    Err(_) => json!(response),
+                };
+            }
+            if !args.uris.is_empty() {
+                params["uris"] = json!(args.uris);
+            }
+            (Verb::PortalScriptSet, params, Outcome::Default)
+        }
+        C::PortalClear(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(interface) = &args.interface {
+                params["interface"] = json!(interface);
+            }
+            (Verb::PortalScriptClear, params, Outcome::Default)
+        }
+        C::PortalHistory(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(limit) = args.limit {
+                params["limit"] = json!(limit);
+            }
+            (Verb::PortalHistory, params, Outcome::Default)
         }
         C::Status(args) => {
             let params = match &args.workspace {

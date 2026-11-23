@@ -59,6 +59,12 @@ pub enum Verb {
     MarkSet,
     /// `mark_list`.
     MarkList,
+    /// `portal_script_set`.
+    PortalScriptSet,
+    /// `portal_script_clear`.
+    PortalScriptClear,
+    /// `portal_history`.
+    PortalHistory,
     /// `status`.
     Status,
 }
@@ -91,6 +97,9 @@ impl Verb {
             Self::GetChangesSince => "get_changes_since",
             Self::MarkSet => "mark_set",
             Self::MarkList => "mark_list",
+            Self::PortalScriptSet => "portal_script_set",
+            Self::PortalScriptClear => "portal_script_clear",
+            Self::PortalHistory => "portal_history",
             Self::Status => "status",
         }
     }
@@ -383,9 +392,79 @@ pub fn render(verb: Verb, r: &Value, outcome: &Outcome) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        Verb::PortalScriptSet => format!(
+            "queued {} script for {} (queue depth {}){}",
+            portal_response_name(r["response"].as_u64().unwrap_or(0)),
+            r["interface"].as_str().unwrap_or("?"),
+            r["queued"],
+            at,
+        ),
+        Verb::PortalScriptClear => {
+            let n = r["cleared"].as_u64().unwrap_or(0);
+            format!(
+                "cleared {} portal script{}{}",
+                n,
+                if n == 1 { "" } else { "s" },
+                at
+            )
+        }
+        Verb::PortalHistory => format_portal_history(r),
         Verb::Status => format_status(r),
         Verb::ClipboardGet => serde_json::to_string_pretty(r).unwrap_or_default(),
     }
+}
+
+/// The friendly name of a portal `Response` code.
+fn portal_response_name(code: u64) -> String {
+    match code {
+        0 => "accept".to_string(),
+        1 => "cancel".to_string(),
+        2 => "close".to_string(),
+        other => format!("code {other}"),
+    }
+}
+
+/// Human rendering of `portal_history`: one line per invocation.
+fn format_portal_history(r: &Value) -> String {
+    let invocations = r["invocations"].as_array();
+    match invocations {
+        None => return "no portal invocations".to_string(),
+        Some(list) if list.is_empty() => return "no portal invocations".to_string(),
+        _ => {}
+    }
+    invocations
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let mut line = format!(
+                "{}.{} caller={} response={} ({})",
+                e["interface"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("?"),
+                e["method"].as_str().unwrap_or("?"),
+                e["caller"].as_str().unwrap_or("?"),
+                portal_response_name(e["response"].as_u64().unwrap_or(9)),
+                if e["scripted"].as_bool().unwrap_or(false) {
+                    "scripted"
+                } else {
+                    "unscripted"
+                },
+            );
+            if let Some(uri) = e["arguments"]["uri"].as_str() {
+                line.push_str(&format!(" uri={uri}"));
+            }
+            if let Some(title) = e["arguments"]["title"].as_str()
+                && !title.is_empty()
+            {
+                line.push_str(&format!(" title=\"{title}\""));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One `list_windows` line.
@@ -435,7 +514,7 @@ fn format_status(r: &Value) -> String {
     if let Some(workspaces) = r["workspaces"].as_array() {
         for ws in workspaces {
             out.push_str(&format!(
-                "\n  {}: {} windows, compositor {}, bus session={} at_spi={}, {}",
+                "\n  {}: {} windows, compositor {}, bus session={} at_spi={}, portal={}, {}",
                 ws["id"].as_str().unwrap_or("?"),
                 ws["window_count"],
                 ws["compositor_responsive"]
@@ -444,6 +523,7 @@ fn format_status(r: &Value) -> String {
                     .unwrap_or("?"),
                 ws["bus"]["session"]["state"].as_str().unwrap_or("?"),
                 ws["bus"]["at_spi"]["state"].as_str().unwrap_or("?"),
+                ws["portal"]["state"].as_str().unwrap_or("?"),
                 ws["healthy"]
                     .as_bool()
                     .map(|ok| if ok { "healthy" } else { "UNHEALTHY" })
