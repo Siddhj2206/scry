@@ -46,7 +46,7 @@ use smithay::{
             },
         },
     },
-    utils::{Serial, Size},
+    utils::{Logical, Point, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -79,7 +79,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     clipboard::SelectionOffers,
     error::Error,
-    event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
+    event::{CompositorEvent, DamageEntry, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
     frame_clock::{FRAME_INTERVAL, FrameClock},
     handle::{Command, Outcome, Reply},
     input::TextInputTracker,
@@ -88,6 +88,13 @@ use crate::{
 };
 
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+
+/// Maximum number of committed-damage records retained for
+/// [`Command::Damage`] queries.
+const DAMAGE_LOG_CAPACITY: usize = 512;
+
+/// Diagonal step between successive newly mapped windows' initial slots.
+const CASCADE_STEP: i32 = 32;
 
 /// Marker stored in every `wl_surface`'s `data_map`, carrying its stable
 /// [`SurfaceId`] and the commit counter up to which its damage was reported.
@@ -183,6 +190,8 @@ pub(crate) struct ScryState {
     pub(crate) windows: Vec<WindowRecord>,
     /// Currently mapped popups (any window's).
     mapped_popups: Vec<PopupRecord>,
+    /// Bounded log of committed surface damage, newest last.
+    damage_log: std::collections::VecDeque<DamageEntry>,
     /// Monotonic event/ack sequence counter.
     pub(crate) seq: Seq,
     next_window_id: u64,
@@ -263,6 +272,7 @@ impl ScryState {
             pending_toplevels: Vec::new(),
             windows: Vec::new(),
             mapped_popups: Vec::new(),
+            damage_log: std::collections::VecDeque::new(),
             seq: 0,
             next_window_id: 1,
             next_surface_id: 1,
@@ -449,6 +459,18 @@ impl ScryState {
         let (damage, surface_id) = self.normalized_damage(surface, attached_buffer);
         if let Some(surface_id) = surface_id {
             let window_id = self.window_id_for_surface(surface);
+            if !damage.is_empty() {
+                // `emit` is about to assign `self.seq + 1` to this event.
+                self.damage_log.push_back(DamageEntry {
+                    seq: self.seq + 1,
+                    surface_id,
+                    window_id,
+                    damage: damage.clone(),
+                });
+                while self.damage_log.len() > DAMAGE_LOG_CAPACITY {
+                    self.damage_log.pop_front();
+                }
+            }
             self.emit(|seq| CompositorEvent::SurfaceCommitted {
                 seq,
                 surface_id,
@@ -492,6 +514,81 @@ impl ScryState {
         })
         .unwrap_or_default();
         (damage, Some(surface_id))
+    }
+
+    /// The deterministic position a newly mapped window starts at: a
+    /// diagonal cascade stepping [`CASCADE_STEP`] per already-mapped window,
+    /// wrapped so the window stays fully inside the primary output whenever
+    /// it fits. Determinism across runs is the point — the same map order
+    /// always produces the same initial layout before any `place_window`.
+    fn initial_location(&self, window: &Window) -> Point<i32, Logical> {
+        let index = self.windows.len() as i32;
+        let Some(primary) = self
+            .outputs
+            .primary()
+            .and_then(|output| self.space.output_geometry(output))
+        else {
+            let offset = index * CASCADE_STEP;
+            return (offset, offset).into();
+        };
+        let size = window.geometry().size;
+        let span_x = (primary.size.w - size.w).max(0) + 1;
+        let span_y = (primary.size.h - size.h).max(0) + 1;
+        let step = index * CASCADE_STEP;
+        (primary.loc.x + step % span_x, primary.loc.y + step % span_y).into()
+    }
+
+    /// Moves a mapped window to exact logical coordinates and, when `size`
+    /// is given, requests it through the `xdg_toplevel` configure/ack
+    /// lifecycle.
+    ///
+    /// `Space::map_element` re-inserts an element at the top of the stack,
+    /// so the windows that were above the target are re-mapped afterwards
+    /// to preserve the existing z-order — placement moves, it does not
+    /// raise. The new position is emitted as `WindowUpdated` immediately:
+    /// a client that never recommits would otherwise leave stale geometry
+    /// on the event stream.
+    fn cmd_place_window(
+        &mut self,
+        id: WindowId,
+        position: (i32, i32),
+        size: Option<(i32, i32)>,
+    ) -> crate::Result<()> {
+        let Some(index) = self.windows.iter().position(|r| r.id == id) else {
+            return Err(Error::UnknownWindow(id));
+        };
+        let window = self.windows[index].window.clone();
+
+        let above: Vec<Window> = self
+            .space
+            .elements()
+            .skip_while(|elem| **elem != window)
+            .skip(1)
+            .cloned()
+            .collect();
+        self.space.map_element(window.clone(), position, false);
+        for upper in above {
+            let Some(location) = self.space.element_location(&upper) else {
+                continue;
+            };
+            self.space.map_element(upper, location, false);
+        }
+
+        if let Some(size) = size
+            && let Some(toplevel) = window.toplevel()
+        {
+            toplevel.with_pending_state(|state| {
+                state.size = Some(Size::from(size));
+            });
+            toplevel.send_configure();
+        }
+
+        let info = self.window_info(id, &window);
+        if self.windows[index].last_info != info {
+            self.windows[index].last_info = info.clone();
+            self.emit(|seq| CompositorEvent::WindowUpdated { seq, window: info });
+        }
+        Ok(())
     }
 
     /// Maps / updates / unmaps a toplevel window following a commit.
@@ -541,8 +638,9 @@ impl ScryState {
         };
         let toplevel = self.pending_toplevels.remove(pos);
         let window = Window::new_wayland_window(toplevel);
-        self.space.map_element(window.clone(), (0, 0), true);
         window.on_commit();
+        let location = self.initial_location(&window);
+        self.space.map_element(window.clone(), location, true);
 
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
@@ -762,6 +860,27 @@ impl ScryState {
                         toplevel.send_configure();
                     });
                 self.send_mutating_reply(&reply, outcome);
+            }
+            Command::PlaceWindow {
+                id,
+                position,
+                size,
+                reply,
+            } => {
+                let outcome = self.cmd_place_window(id, position, size);
+                self.send_mutating_reply(&reply, outcome);
+            }
+            Command::Damage { since, reply } => {
+                let damage = self
+                    .damage_log
+                    .iter()
+                    .filter(|entry| entry.seq > since)
+                    .cloned()
+                    .collect();
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: damage,
+                }));
             }
             Command::CloseWindow { id, reply } => {
                 let outcome = self

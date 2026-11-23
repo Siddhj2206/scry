@@ -5,4 +5,5 @@
 //! waits, diffs) get their own module here.
 
 pub mod output;
+pub mod windows;
 pub mod workspace;

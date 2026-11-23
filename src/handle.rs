@@ -16,7 +16,7 @@ use smithay::reexports::calloop::channel::Sender as CommandSender;
 use crate::{
     clipboard::SelectionKind,
     error::{Error, Result},
-    event::{CompositorEvent, PopupInfo, Seq, WindowId, WindowInfo},
+    event::{CompositorEvent, DamageEntry, PopupInfo, Seq, WindowId, WindowInfo},
     frame::Frame,
     frame_clock::FrameClockMode,
     input::{PointerButton, PointerTarget},
@@ -87,6 +87,20 @@ pub(crate) enum Command {
     CloseWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
+    },
+    /// Move a toplevel to exact logical coordinates and optionally request
+    /// a resize through the configure/ack lifecycle.
+    PlaceWindow {
+        id: WindowId,
+        position: (i32, i32),
+        size: Option<(i32, i32)>,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Snapshot the retained damage log: every recorded commit's damage
+    /// with `seq` strictly greater than `since`.
+    Damage {
+        since: Seq,
+        reply: Sender<Outcome<Vec<DamageEntry>>>,
     },
 
     // -- input ---------------------------------------------------------------
@@ -274,6 +288,41 @@ impl CompositorHandle {
             size: (width, height),
             reply,
         })
+    }
+
+    /// Moves a window to exact logical coordinates and, when `size` is
+    /// given, requests that size through the `xdg_toplevel` configure/ack
+    /// lifecycle.
+    ///
+    /// The position applies immediately in compositor space (a
+    /// [`CompositorEvent::WindowUpdated`] reports it right away); the
+    /// requested size lands once the client acks the configure and commits
+    /// at the new size, emitting a second `WindowUpdated`. Moving preserves
+    /// the window's stacking position. `size: None` is a pure move and sends
+    /// no configure.
+    pub fn place_window(
+        &self,
+        id: WindowId,
+        position: (i32, i32),
+        size: Option<(i32, i32)>,
+    ) -> Result<Reply<()>> {
+        self.request(|reply| Command::PlaceWindow {
+            id,
+            position,
+            size,
+            reply,
+        })
+    }
+
+    /// Damage records for surface commits with `seq` strictly greater
+    /// than `since` (`0` returns the whole retained log).
+    ///
+    /// Entries carry normalized buffer-space rectangles and the window the
+    /// committing surface belonged to — exactly what `get_damage` exposes
+    /// over the control API. The log is bounded; entries older than its
+    /// retention window are dropped silently.
+    pub fn damage_since(&self, since: Seq) -> Result<Reply<Vec<DamageEntry>>> {
+        self.request(|reply| Command::Damage { since, reply })
     }
 
     /// Requests `xdg_toplevel.close` for a window.
