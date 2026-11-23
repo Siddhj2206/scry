@@ -52,6 +52,8 @@ pub struct ClientState {
     pub output_scales: Vec<i32>,
     pub enters: usize,
     pub frame_callbacks: usize,
+    /// `callback_data` (presentation time, ms) of every `wl_callback.done`.
+    pub frame_times: Vec<u32>,
 }
 
 /// A connected test client with the core globals bound.
@@ -340,8 +342,9 @@ impl Dispatch<wl_callback::WlCallback, u32> for ClientState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
+        if let wl_callback::Event::Done { callback_data } = event {
             state.frame_callbacks += 1;
+            state.frame_times.push(callback_data);
         }
     }
 }
