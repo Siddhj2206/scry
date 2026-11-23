@@ -55,6 +55,10 @@ pub enum Verb {
     WaitForIdle,
     /// `get_tree`.
     GetTree,
+    /// `tree_find`.
+    TreeFind,
+    /// `tree_diff`.
+    TreeDiff,
     /// `click_node`.
     ClickNode,
     /// `node_action`.
@@ -101,6 +105,8 @@ impl Verb {
             Self::WaitForCommit => "wait_for_commit",
             Self::WaitForIdle => "wait_for_idle",
             Self::GetTree => "get_tree",
+            Self::TreeFind => "tree_find",
+            Self::TreeDiff => "tree_diff",
             Self::ClickNode => "click_node",
             Self::NodeAction => "node_action",
             Self::GetChangesSince => "get_changes_since",
@@ -368,6 +374,8 @@ pub fn render(verb: Verb, r: &Value, outcome: &Outcome) -> String {
             format!("workspace idle after {}ms quiet{}", r["quiet_ms"], at)
         }
         Verb::GetTree => format_tree(r),
+        Verb::TreeFind => format_tree_find(r),
+        Verb::TreeDiff => format_tree_diff(r),
         Verb::ClickNode => format!(
             "clicked {} at ({},{}) x{} on {} (window {}){}",
             r["button"],
@@ -563,6 +571,84 @@ fn format_tree(r: &Value) -> String {
     for w in windows {
         out.push('\n');
         out.push_str(&format_tree_window(w));
+    }
+    out
+}
+
+/// Human rendering of `tree_find`: a snapshot/match-count header, then
+/// each match's ref line followed by its canonical context block —
+/// context lines indented, the match line marked `>`.
+fn format_tree_find(r: &Value) -> String {
+    let count = r["match_count"].as_u64().unwrap_or(0);
+    let mut out = format!(
+        "snapshot {} — {}",
+        r["snapshot_id"],
+        if count == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{count} match{}", if count == 1 { "" } else { "es" })
+        }
+    );
+    let Some(matches) = r["matches"].as_array() else {
+        return out;
+    };
+    for m in matches {
+        out.push_str(&format!(
+            "\n{} {} {:?} (window {})",
+            m["ref"].as_str().unwrap_or("?"),
+            m["role"].as_str().unwrap_or("?"),
+            m["name"].as_str().unwrap_or(""),
+            m["window_id"],
+        ));
+        let context = &m["context"];
+        if let Some(before) = context["before"].as_array() {
+            for line in before {
+                out.push_str(&format!("\n    {}", line.as_str().unwrap_or("")));
+            }
+        }
+        if let Some(matched) = context["match"].as_str() {
+            out.push_str(&format!("\n  > {matched}"));
+        }
+        if let Some(after) = context["after"].as_array() {
+            for line in after {
+                out.push_str(&format!("\n    {}", line.as_str().unwrap_or("")));
+            }
+        }
+    }
+    out
+}
+
+/// Human rendering of `tree_diff`: a `from → to` header, then each
+/// hunk's `-`/`+` lines grouped by kind.
+fn format_tree_diff(r: &Value) -> String {
+    let changed = r["changed"].as_bool().unwrap_or(false);
+    let mut out = format!(
+        "diff snapshot {} → {}",
+        r["from_snapshot"], r["snapshot_id"]
+    );
+    if !changed {
+        out.push_str(" — no changes");
+        return out;
+    }
+    out.push_str(&format!(
+        " — {} added, {} removed",
+        r["added_lines"], r["removed_lines"]
+    ));
+    let Some(hunks) = r["hunks"].as_array() else {
+        return out;
+    };
+    for hunk in hunks {
+        out.push_str(&format!("\n{}", hunk["kind"].as_str().unwrap_or("changed")));
+        if let Some(removed) = hunk["removed"].as_array() {
+            for line in removed {
+                out.push_str(&format!("\n- {}", line.as_str().unwrap_or("")));
+            }
+        }
+        if let Some(added) = hunk["added"].as_array() {
+            for line in added {
+                out.push_str(&format!("\n+ {}", line.as_str().unwrap_or("")));
+            }
+        }
     }
     out
 }
