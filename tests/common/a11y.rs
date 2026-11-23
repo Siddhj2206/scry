@@ -17,6 +17,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -75,6 +76,11 @@ pub struct FakeNode {
     /// AT-SPI state names to report (`"enabled"`, `"showing"`, ...).
     #[serde(default)]
     pub states: Vec<String>,
+    /// Action names the node offers on `org.a11y.atspi.Action`
+    /// (`"click"`, `"press"`, ...); empty = no `Action` interface. The
+    /// first entry is the node's conventional default action.
+    #[serde(default)]
+    pub actions: Vec<String>,
     /// Child nodes.
     #[serde(default)]
     pub children: Vec<FakeNode>,
@@ -88,6 +94,7 @@ impl FakeNode {
             role: role.to_string(),
             bounds: None,
             states: vec!["enabled".into(), "showing".into(), "visible".into()],
+            actions: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -109,7 +116,49 @@ impl FakeNode {
         self.children.push(child);
         self
     }
+
+    /// Sets the `org.a11y.atspi.Action` names the node offers.
+    pub fn actions(mut self, actions: &[&str]) -> Self {
+        self.actions = actions.iter().map(|s| s.to_string()).collect();
+        self
+    }
 }
+
+/// The live, mutable state behind one served node — the seam staleness
+/// and `node_action` tests drive after `serve` returns.
+struct NodeState {
+    name: String,
+    role: u32,
+    role_name: String,
+    states: Vec<u32>,
+    bounds: Option<[i32; 4]>,
+    children: Vec<(String, OwnedObjectPath)>,
+    /// This node's path inside its parent, so `remove_node` can prune it
+    /// from the parent's `GetChildren`.
+    parent_path: Option<String>,
+    interfaces: Vec<String>,
+    actions: Vec<atspi::Action>,
+    /// `DoAction` invocations recorded, as action names.
+    invoked: Vec<String>,
+    /// Once set, every interface method fails like a vanished object.
+    removed: bool,
+}
+
+impl NodeState {
+    /// `fdo::Error::Failed` once the node is removed — what an AT-SPI
+    /// client sees when the object's widget was destroyed.
+    fn check_live(&self) -> zbus::fdo::Result<()> {
+        if self.removed {
+            return Err(zbus::fdo::Error::Failed(
+                "the accessible object no longer exists".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// All nodes of one served tree, keyed by object path.
+type Nodes = Arc<Mutex<HashMap<String, Arc<Mutex<NodeState>>>>>;
 
 /// A registered fake peer: keeps the a11y-bus connection (and therefore
 /// the registration) alive until dropped.
@@ -119,6 +168,58 @@ pub struct FakePeer {
     /// The served application root's object path.
     pub root_path: String,
     conn: zbus::blocking::Connection,
+    nodes: Nodes,
+}
+
+impl FakePeer {
+    /// One node's mutable state by object path.
+    fn node(&self, path: &str) -> Arc<Mutex<NodeState>> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(path)
+            .unwrap_or_else(|| panic!("no served node at {path}"))
+            .clone()
+    }
+
+    /// Changes a served node's accessible name — drives the `STALE_REF`
+    /// name-mismatch path in `click_node`/`node_action` tests.
+    pub fn set_name(&self, path: &str, name: &str) {
+        let node = self.node(path);
+        node.lock().unwrap().name = name.to_string();
+    }
+
+    /// Changes a served node's role by role name (`"push button"`, …) —
+    /// drives the `STALE_REF` role-mismatch path.
+    pub fn set_role(&self, path: &str, role: &str) {
+        let node = self.node(path);
+        let mut node = node.lock().unwrap();
+        node.role = role_value(role);
+        node.role_name = role.to_string();
+    }
+
+    /// Removes a served node: its own methods start failing and its
+    /// parent's `GetChildren` drops it — the `STALE_REF` disappearance
+    /// path.
+    pub fn remove_node(&self, path: &str) {
+        let parent_path = {
+            let node = self.node(path);
+            let mut node = node.lock().unwrap();
+            node.removed = true;
+            node.parent_path.clone()
+        };
+        if let Some(parent_path) = parent_path {
+            let parent = self.node(&parent_path);
+            let mut parent = parent.lock().unwrap();
+            parent.children.retain(|(_, child)| child.as_str() != path);
+        }
+    }
+
+    /// The action names `DoAction` recorded on a node, in order.
+    pub fn invoked_actions(&self, path: &str) -> Vec<String> {
+        let node = self.node(path);
+        node.lock().unwrap().invoked.clone()
+    }
 }
 
 /// Waits for `org.a11y.atspi.Registry` to own a name on `conn`'s bus.
@@ -174,6 +275,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         index += 1;
     }
 
+    let nodes: Nodes = Arc::new(Mutex::new(HashMap::new()));
     for (path, node, parent) in &flat {
         let children: Vec<(String, OwnedObjectPath)> = node
             .children
@@ -197,31 +299,59 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         if node.bounds.is_some() {
             interfaces.push("org.a11y.atspi.Component".to_string());
         }
-        let role = role_value(&node.role);
+        if !node.actions.is_empty() {
+            interfaces.push("org.a11y.atspi.Action".to_string());
+        }
+        let state = Arc::new(Mutex::new(NodeState {
+            name: node.name.clone(),
+            role: role_value(&node.role),
+            role_name: node.role.clone(),
+            states: state_words(&node.states),
+            bounds: node.bounds,
+            children,
+            parent_path: parent.clone(),
+            interfaces,
+            actions: node
+                .actions
+                .iter()
+                .map(|name| atspi::Action {
+                    name: name.clone(),
+                    description: format!("fake {name}"),
+                    keybinding: String::new(),
+                })
+                .collect(),
+            invoked: Vec::new(),
+            removed: false,
+        }));
+        nodes.lock().unwrap().insert(path.clone(), state.clone());
         conn.object_server()
             .at(
                 path.as_str(),
                 FakeAccessible {
                     unique: unique.clone(),
-                    name: node.name.clone(),
-                    role,
-                    role_name: node.role.clone(),
-                    states: state_words(&node.states),
                     parent: parent_ref,
                     app: (
                         unique.clone(),
                         OwnedObjectPath::try_from(root_path.as_str()).unwrap(),
                     ),
-                    children,
-                    child_count: node.children.len() as i32,
-                    interfaces,
+                    state: state.clone(),
                 },
             )
             .unwrap_or_else(|e| panic!("failed to serve {path}: {e}"));
-        if let Some(bounds) = node.bounds {
+        if node.bounds.is_some() {
             conn.object_server()
-                .at(path.as_str(), FakeComponent { bounds })
+                .at(
+                    path.as_str(),
+                    FakeComponent {
+                        state: state.clone(),
+                    },
+                )
                 .unwrap_or_else(|e| panic!("failed to serve {path} component: {e}"));
+        }
+        if !node.actions.is_empty() {
+            conn.object_server()
+                .at(path.as_str(), FakeAction { state })
+                .unwrap_or_else(|e| panic!("failed to serve {path} action: {e}"));
         }
     }
 
@@ -247,6 +377,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         bus_name: unique,
         root_path,
         conn,
+        nodes,
     }
 }
 
@@ -289,28 +420,29 @@ pub fn run_helper() -> ! {
     }
 }
 
-/// `org.a11y.atspi.Accessible` implementation for one fake node.
+/// `org.a11y.atspi.Accessible` implementation for one fake node. All
+/// answers read `state` live, so tests can mutate or remove the node
+/// after `serve` returns.
 struct FakeAccessible {
     unique: String,
-    name: String,
-    role: u32,
-    role_name: String,
-    states: Vec<u32>,
     parent: (String, OwnedObjectPath),
     app: (String, OwnedObjectPath),
-    children: Vec<(String, OwnedObjectPath)>,
-    child_count: i32,
-    interfaces: Vec<String>,
+    state: Arc<Mutex<NodeState>>,
 }
 
 #[zbus::interface(name = "org.a11y.atspi.Accessible")]
 impl FakeAccessible {
-    async fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
-        self.children.clone()
+    async fn get_children(&self) -> zbus::fdo::Result<Vec<(String, OwnedObjectPath)>> {
+        let state = self.state.lock().unwrap();
+        state.check_live()?;
+        Ok(state.children.clone())
     }
 
     async fn get_child_at_index(&self, index: i32) -> (String, OwnedObjectPath) {
-        self.children
+        self.state
+            .lock()
+            .unwrap()
+            .children
             .get(index as usize)
             .cloned()
             .unwrap_or_else(|| (String::new(), OwnedObjectPath::try_from(NULL_PATH).unwrap()))
@@ -320,24 +452,26 @@ impl FakeAccessible {
         0
     }
 
-    async fn get_role(&self) -> u32 {
-        self.role
+    async fn get_role(&self) -> zbus::fdo::Result<u32> {
+        let state = self.state.lock().unwrap();
+        state.check_live()?;
+        Ok(state.role)
     }
 
     async fn get_role_name(&self) -> String {
-        self.role_name.clone()
+        self.state.lock().unwrap().role_name.clone()
     }
 
     async fn get_localized_role_name(&self) -> String {
-        self.role_name.clone()
+        self.state.lock().unwrap().role_name.clone()
     }
 
     async fn get_state(&self) -> Vec<u32> {
-        self.states.clone()
+        self.state.lock().unwrap().states.clone()
     }
 
     async fn get_interfaces(&self) -> Vec<String> {
-        self.interfaces.clone()
+        self.state.lock().unwrap().interfaces.clone()
     }
 
     async fn get_attributes(&self) -> HashMap<String, String> {
@@ -353,8 +487,10 @@ impl FakeAccessible {
     }
 
     #[zbus(property)]
-    async fn name(&self) -> String {
-        self.name.clone()
+    async fn name(&self) -> zbus::fdo::Result<String> {
+        let state = self.state.lock().unwrap();
+        state.check_live()?;
+        Ok(state.name.clone())
     }
 
     #[zbus(property)]
@@ -369,24 +505,26 @@ impl FakeAccessible {
 
     #[zbus(property)]
     async fn child_count(&self) -> i32 {
-        self.child_count
+        self.state.lock().unwrap().children.len() as i32
     }
 
     #[zbus(property)]
     async fn accessible_id(&self) -> String {
-        self.name.clone()
+        self.state.lock().unwrap().name.clone()
     }
 }
 
 /// `org.a11y.atspi.Component` implementation for bounded fake nodes.
 struct FakeComponent {
-    bounds: [i32; 4],
+    state: Arc<Mutex<NodeState>>,
 }
 
 #[zbus::interface(name = "org.a11y.atspi.Component")]
 impl FakeComponent {
     async fn contains(&self, x: i32, y: i32, _coord_type: u32) -> bool {
-        let [bx, by, w, h] = self.bounds;
+        let Some([bx, by, w, h]) = self.state.lock().unwrap().bounds else {
+            return false;
+        };
         x >= bx && x < bx + w && y >= by && y < by + h
     }
 
@@ -400,15 +538,17 @@ impl FakeComponent {
     }
 
     async fn get_extents(&self, _coord_type: u32) -> (i32, i32, i32, i32) {
-        self.bounds.into()
+        self.state.lock().unwrap().bounds.unwrap_or_default().into()
     }
 
     async fn get_position(&self, _coord_type: u32) -> (i32, i32) {
-        (self.bounds[0], self.bounds[1])
+        let bounds = self.state.lock().unwrap().bounds.unwrap_or_default();
+        (bounds[0], bounds[1])
     }
 
     async fn get_size(&self) -> (i32, i32) {
-        (self.bounds[2], self.bounds[3])
+        let bounds = self.state.lock().unwrap().bounds.unwrap_or_default();
+        (bounds[2], bounds[3])
     }
 
     async fn get_layer(&self) -> u32 {
@@ -453,6 +593,73 @@ impl FakeComponent {
 
     async fn set_size(&self, _width: i32, _height: i32) -> bool {
         false
+    }
+}
+
+/// `org.a11y.atspi.Action` implementation for actionable fake nodes:
+/// `DoAction` records the invoked action's name into `state.invoked`.
+struct FakeAction {
+    state: Arc<Mutex<NodeState>>,
+}
+
+#[zbus::interface(name = "org.a11y.atspi.Action")]
+impl FakeAction {
+    async fn do_action(&self, index: i32) -> zbus::fdo::Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        state.check_live()?;
+        let Some(action) = state.actions.get(index as usize) else {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "no action at index {index}"
+            )));
+        };
+        let name = action.name.clone();
+        state.invoked.push(name);
+        Ok(true)
+    }
+
+    async fn get_actions(&self) -> zbus::fdo::Result<Vec<atspi::Action>> {
+        let state = self.state.lock().unwrap();
+        state.check_live()?;
+        Ok(state.actions.clone())
+    }
+
+    async fn get_description(&self, index: i32) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .actions
+            .get(index as usize)
+            .map(|a| a.description.clone())
+            .unwrap_or_default()
+    }
+
+    async fn get_key_binding(&self, index: i32) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .actions
+            .get(index as usize)
+            .map(|a| a.keybinding.clone())
+            .unwrap_or_default()
+    }
+
+    async fn get_localized_name(&self, index: i32) -> String {
+        self.get_name(index).await
+    }
+
+    async fn get_name(&self, index: i32) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .actions
+            .get(index as usize)
+            .map(|a| a.name.clone())
+            .unwrap_or_default()
+    }
+
+    #[zbus(property)]
+    async fn n_actions(&self) -> i32 {
+        self.state.lock().unwrap().actions.len() as i32
     }
 }
 

@@ -97,6 +97,8 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::waits::WAIT_FOR_COMMIT,
     crate::daemon::methods::waits::WAIT_FOR_IDLE,
     crate::daemon::methods::tree::GET_TREE,
+    crate::daemon::methods::node::CLICK_NODE,
+    crate::daemon::methods::node::NODE_ACTION,
     crate::daemon::methods::portal::SCRIPT_SET,
     crate::daemon::methods::portal::SCRIPT_CLEAR,
     crate::daemon::methods::portal::HISTORY,
