@@ -7,10 +7,7 @@
 //! connection's cancellation token, a periodic `client_pid` liveness check
 //! and the overall deadline — zero polling sleeps.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     CompositorEvent, Seq, WindowId, WindowInfo,
     daemon::{
+        now_ms,
         protocol::{ErrorResponse, code},
         registry::{Workspace, commit_seq},
         router::{Call, MethodDef, Scope},
@@ -32,14 +30,6 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_QUIET_MS: u64 = 250;
 /// How often an in-flight wait re-checks `client_pid` liveness.
 const LIVENESS_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Milliseconds since the Unix epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// Whether `pid` still refers to a live, non-zombie process.
 ///
@@ -66,10 +56,6 @@ fn pid_alive(_pid: u32) -> bool {
     // Process-liveness probing is only implemented on Linux; elsewhere the
     // check is a no-op so disconnect cancellation still applies.
     true
-}
-
-fn invalid_params(msg: impl Into<String>) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, msg.into())
 }
 
 fn timeout_error(verb: &str, timeout_ms: u64) -> ErrorResponse {
@@ -119,11 +105,16 @@ enum WaitStep {
 }
 
 /// Drives one event-driven wait: multiplexes the workspace event stream,
-/// the connection-cancel token, `client_pid` liveness, and the deadline.
+/// the workspace-closing and connection-cancel tokens, `client_pid`
+/// liveness, and the deadline.
 struct WaitDriver {
     rx: broadcast::Receiver<CompositorEvent>,
     ws: Arc<Workspace>,
     cancel: CancellationToken,
+    /// Cancelled when the workspace begins teardown — the only reliable
+    /// "workspace closed" signal, since the `Arc<Workspace>` this driver
+    /// holds keeps the broadcast sender alive past `rx`'s `Closed`.
+    ws_closing: CancellationToken,
     pids: Vec<u32>,
     liveness: tokio::time::Interval,
     deadline: tokio::time::Instant,
@@ -144,6 +135,7 @@ impl WaitDriver {
             rx: ws.subscribe(),
             ws: ws.clone(),
             cancel,
+            ws_closing: ws.closing_token(),
             pids,
             liveness,
             deadline: tokio::time::Instant::now() + Duration::from_millis(timeout_ms.max(1)),
@@ -156,6 +148,7 @@ impl WaitDriver {
     async fn next(&mut self, quiet: Option<Duration>) -> WaitStep {
         tokio::select! {
             _ = self.cancel.cancelled() => WaitStep::Cancelled("client_disconnected"),
+            _ = self.ws_closing.cancelled() => WaitStep::Closed,
             _ = self.liveness.tick() => {
                 // A live workspace with an open client is activity: the
                 // tick also keeps the idle reaper from reaping us.
@@ -213,7 +206,7 @@ impl WindowWaitParams {
         match self.title_match.as_deref() {
             None | Some("substring") => Ok(true),
             Some("exact") => Ok(false),
-            Some(other) => Err(invalid_params(format!(
+            Some(other) => Err(ErrorResponse::invalid_params(format!(
                 "unknown title_match {other:?}: use \"exact\" or \"substring\""
             ))),
         }
@@ -246,10 +239,10 @@ async fn wait_for_window(call: Call) -> Result<Value, ErrorResponse> {
         .workspace
         .clone()
         .expect("workspace scope resolves a workspace");
-    let params: WindowWaitParams =
-        serde_json::from_value(call.params).map_err(|e| invalid_params(e.to_string()))?;
+    let params: WindowWaitParams = serde_json::from_value(call.params)
+        .map_err(|e| ErrorResponse::invalid_params(e.to_string()))?;
     if params.app_id.is_none() && params.title.is_none() && params.pid.is_none() {
-        return Err(invalid_params(
+        return Err(ErrorResponse::invalid_params(
             "wait_for_window needs at least one criterion: app_id, title or pid",
         ));
     }
@@ -323,8 +316,8 @@ async fn wait_for_commit(call: Call) -> Result<Value, ErrorResponse> {
         .workspace
         .clone()
         .expect("workspace scope resolves a workspace");
-    let params: CommitWaitParams =
-        serde_json::from_value(call.params).map_err(|e| invalid_params(e.to_string()))?;
+    let params: CommitWaitParams = serde_json::from_value(call.params)
+        .map_err(|e| ErrorResponse::invalid_params(e.to_string()))?;
     let after_seq = params.after_seq.unwrap_or(0);
     let window = params.window.map(WindowId);
     let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -390,8 +383,8 @@ async fn wait_for_idle(call: Call) -> Result<Value, ErrorResponse> {
         .workspace
         .clone()
         .expect("workspace scope resolves a workspace");
-    let params: IdleWaitParams =
-        serde_json::from_value(call.params).map_err(|e| invalid_params(e.to_string()))?;
+    let params: IdleWaitParams = serde_json::from_value(call.params)
+        .map_err(|e| ErrorResponse::invalid_params(e.to_string()))?;
     let quiet_ms = params.quiet_ms.unwrap_or(DEFAULT_QUIET_MS);
     let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
 

@@ -144,6 +144,19 @@ impl ErrorResponse {
             data: Some(data),
         }
     }
+
+    /// An [`INVALID_PARAMS`](code::INVALID_PARAMS) error: `err` is a decode
+    /// failure or a caller-composed message, reported verbatim after an
+    /// "invalid params:" prefix.
+    pub fn invalid_params(err: impl std::fmt::Display) -> Self {
+        Self::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
+    }
+
+    /// An [`INVALID_PARAMS`](code::INVALID_PARAMS) error carrying
+    /// structured `data` alongside the message.
+    pub fn invalid_params_data(message: impl Into<String>, data: Value) -> Self {
+        Self::with_data(code::INVALID_PARAMS, message, data)
+    }
 }
 
 impl From<crate::Error> for ErrorResponse {
@@ -171,7 +184,7 @@ impl From<crate::Error> for ErrorResponse {
             | E::NoFocusedSurface
             | E::UnmappableCharacter(_)
             | E::EmptySelection(_)
-            | E::MimeTypeNotOffered { .. } => Self::new(code::INVALID_PARAMS, err.to_string()),
+            | E::MimeTypeNotOffered { .. } => Self::invalid_params(err),
             other => Self::new(code::COMPOSITOR, other.to_string()),
         }
     }

@@ -978,6 +978,11 @@ impl ScryState {
                     value,
                 }));
             }
+            Command::BumpSeq { reply } => {
+                // A pure seq reservation: the mutating reply allocates a
+                // fresh point so daemon-side marks share this timeline.
+                self.send_mutating_reply(&reply, Ok(()));
+            }
         }
         // Commands may have produced protocol traffic (configures, closes).
         if let Err(err) = self.display_handle.flush_clients() {

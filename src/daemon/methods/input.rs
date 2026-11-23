@@ -17,16 +17,12 @@ use serde_json::{Value, json};
 use crate::{
     Error, Reply, SelectionKind, WindowId, WindowInfo,
     daemon::{
-        protocol::{ErrorResponse, code},
+        protocol::ErrorResponse,
         registry::Workspace,
         router::{MethodDef, Scope},
     },
     input::{PointerButton, PointerTarget},
 };
-
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
 
 /// `click` — move the pointer and press/release a button (mutating).
 pub const CLICK: MethodDef = MethodDef {
@@ -160,7 +156,7 @@ fn button_param(value: Option<&Value>) -> Result<PointerButton, ErrorResponse> {
     match value {
         None | Some(Value::Null) => Ok(PointerButton::Left),
         Some(Value::String(name)) => named_button(name).ok_or_else(|| {
-            invalid_params(format!(
+            ErrorResponse::invalid_params(format!(
                 "unknown button {name:?}: expected a button name or evdev code"
             ))
         }),
@@ -169,7 +165,7 @@ fn button_param(value: Option<&Value>) -> Result<PointerButton, ErrorResponse> {
                 .as_u64()
                 .and_then(|code| u32::try_from(code).ok())
                 .ok_or_else(|| {
-                    invalid_params(format!(
+                    ErrorResponse::invalid_params(format!(
                         "button must be a non-negative integer, got {value}"
                     ))
                 })?;
@@ -178,7 +174,7 @@ fn button_param(value: Option<&Value>) -> Result<PointerButton, ErrorResponse> {
             button.code().map_err(ErrorResponse::from)?;
             Ok(button)
         }
-        Some(other) => Err(invalid_params(format!(
+        Some(other) => Err(ErrorResponse::invalid_params(format!(
             "button must be a name or evdev code, got {other}"
         ))),
     }
@@ -219,7 +215,7 @@ fn selection_kind(value: Option<&str>) -> Result<SelectionKind, ErrorResponse> {
     match value {
         None | Some("clipboard") => Ok(SelectionKind::Clipboard),
         Some("primary") => Ok(SelectionKind::Primary),
-        Some(other) => Err(invalid_params(format!(
+        Some(other) => Err(ErrorResponse::invalid_params(format!(
             "unknown selection {other:?}: expected \"clipboard\" or \"primary\""
         ))),
     }
@@ -240,11 +236,12 @@ struct ClickParams {
 }
 
 async fn click(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: ClickParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: ClickParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let button = button_param(params.button.as_ref())?;
     let count = params.count.unwrap_or(1);
     if !(1..=64).contains(&count) {
-        return Err(invalid_params(format!(
+        return Err(ErrorResponse::invalid_params(format!(
             "click count must be between 1 and 64, got {count}"
         )));
     }
@@ -283,7 +280,8 @@ struct DragParams {
 }
 
 async fn drag(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: DragParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: DragParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let button = button_param(params.button.as_ref())?;
     let steps = params.steps.unwrap_or(8).clamp(1, 64);
     let from = params.from;
@@ -297,25 +295,40 @@ async fn drag(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse>
             let from_g = from.global(&windows)?;
             let to_g = to.global(&windows)?;
 
+            // Validate both endpoints *before* pressing: an out-of-bounds
+            // `to` must fail here rather than leave a dangling press when
+            // the final motion rejects it.
+            handle.move_pointer(to.target(), to.x, to.y)?;
             handle.move_pointer(from.target(), from.x, from.y)?;
             handle.press_pointer_button(button)?;
-            for i in 1..=steps {
-                if i == steps {
-                    // The final motion targets `to`'s own space: window-local
-                    // endpoints stay validated and hit occluded windows.
-                    handle.move_pointer(to.target(), to.x, to.y)?;
-                } else {
-                    let t = f64::from(i) / f64::from(steps);
-                    let x = from_g.0 + (to_g.0 - from_g.0) * t;
-                    let y = from_g.1 + (to_g.1 - from_g.1) * t;
-                    handle.move_pointer(PointerTarget::Output, x, y)?;
+            let outcome = (|| {
+                for i in 1..=steps {
+                    if i == steps {
+                        // The final motion targets `to`'s own space:
+                        // window-local endpoints stay validated and hit
+                        // occluded windows.
+                        handle.move_pointer(to.target(), to.x, to.y)?;
+                    } else {
+                        let t = f64::from(i) / f64::from(steps);
+                        let x = from_g.0 + (to_g.0 - from_g.0) * t;
+                        let y = from_g.1 + (to_g.1 - from_g.1) * t;
+                        handle.move_pointer(PointerTarget::Output, x, y)?;
+                    }
+                }
+                handle.release_pointer_button(button)
+            })();
+            match outcome {
+                Ok(release) => Ok(Reply {
+                    seq: release.seq,
+                    value: (from_g, to_g),
+                }),
+                Err(err) => {
+                    // A mid-drag failure (e.g. the target window vanished)
+                    // must never leave the pointer button pressed.
+                    let _ = handle.release_pointer_button(button);
+                    Err(err)
                 }
             }
-            let release = handle.release_pointer_button(button)?;
-            Ok(Reply {
-                seq: release.seq,
-                value: (from_g, to_g),
-            })
         })
         .await?;
     let (from_g, to_g) = reply.value;
@@ -337,7 +350,8 @@ struct TypeTextParams {
 }
 
 async fn type_text(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: TypeTextParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: TypeTextParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let text = params.text;
     let window = params.window;
     let injected = text.clone();
@@ -367,7 +381,8 @@ struct KeyComboParams {
 }
 
 async fn key_combo(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: KeyComboParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: KeyComboParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let key = params.key;
     let modifiers = params.modifiers.unwrap_or_default();
     let window = params.window;
@@ -401,7 +416,8 @@ struct ClipboardGetParams {
 }
 
 async fn clipboard_get(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: ClipboardGetParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: ClipboardGetParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let kind = selection_kind(params.selection.as_deref())?;
     let requested = params.mime;
 
@@ -450,21 +466,22 @@ struct ClipboardSetParams {
 }
 
 async fn clipboard_set(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: ClipboardSetParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: ClipboardSetParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let kind = selection_kind(params.selection.as_deref())?;
     let mime = params.mime.unwrap_or_else(|| TEXT_MIME.to_string());
     let data = match (params.data, params.data_base64) {
         (Some(text), None) => text.into_bytes(),
-        (None, Some(b64)) => BASE64
-            .decode(&b64)
-            .map_err(|err| invalid_params(format!("data_base64 is not valid base64: {err}")))?,
+        (None, Some(b64)) => BASE64.decode(&b64).map_err(|err| {
+            ErrorResponse::invalid_params(format!("data_base64 is not valid base64: {err}"))
+        })?,
         (None, None) => {
-            return Err(invalid_params(
+            return Err(ErrorResponse::invalid_params(
                 "clipboard_set requires \"data\" or \"data_base64\"",
             ));
         }
         (Some(_), Some(_)) => {
-            return Err(invalid_params(
+            return Err(ErrorResponse::invalid_params(
                 "pass either \"data\" or \"data_base64\", not both",
             ));
         }

@@ -17,18 +17,21 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
     Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
+    compositor::{JoinOutcome, join_bounded},
     daemon::{
         changelog::{ChangeLog, Mark},
+        now_ms,
         process::{ProcessInfo, ProcessRegistry, SpawnSpec},
         protocol::{ErrorResponse, code},
     },
@@ -62,14 +65,6 @@ pub(crate) fn commit_seq(
         }
         _ => None,
     }
-}
-
-/// Milliseconds since the Unix epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Validates an agent-chosen workspace id: a filesystem- and slug-safe
@@ -131,6 +126,10 @@ struct PersistedMeta {
     spawned_pids: Vec<u32>,
 }
 
+/// How long teardown waits for the event-pump thread before detaching
+/// it, so a stuck pump can never deadlock `workspace_close`.
+const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A live workspace: one isolated compositor plus bookkeeping.
 pub struct Workspace {
     id: String,
@@ -142,6 +141,13 @@ pub struct Workspace {
     compositor: Mutex<Option<Compositor>>,
     /// Join handle of the event-pump thread; joined during teardown.
     pump: Mutex<Option<JoinHandle<()>>>,
+    /// Cancelled at the start of [`Self::teardown`]: in-flight wait verbs
+    /// select on it to abort promptly, and `spawn_process` checks it so
+    /// children can never leak past the kill window.
+    closing: CancellationToken,
+    /// Serializes mark allocation so `bump_seq` + `set_mark` stay atomic
+    /// and marks remain in seq order.
+    mark_guard: tokio::sync::Mutex<()>,
     /// Broadcast of every compositor event, for event-driven verbs.
     events: broadcast::Sender<CompositorEvent>,
     /// Bounded ring of the most recent events, for `wait_for_commit`'s
@@ -237,6 +243,8 @@ impl Workspace {
             handle,
             compositor: Mutex::new(Some(compositor)),
             pump: Mutex::new(Some(pump)),
+            closing: CancellationToken::new(),
+            mark_guard: tokio::sync::Mutex::new(()),
             events,
             recent,
             processes: ProcessRegistry::new(),
@@ -319,6 +327,13 @@ impl Workspace {
         }
     }
 
+    /// The token cancelled when teardown begins. Blocking verbs select
+    /// on it so a `workspace_close` never leaves them hanging on the
+    /// (kept-alive) broadcast channel.
+    pub(crate) fn closing_token(&self) -> CancellationToken {
+        self.closing.clone()
+    }
+
     /// Whether the workspace currently holds a live compositor.
     pub fn is_live(&self) -> bool {
         self.compositor
@@ -333,24 +348,26 @@ impl Workspace {
     /// Fails if the workspace is already being torn down; if teardown races
     /// the spawn, the just-started child is signalled along with the rest.
     pub fn spawn_process(&self, spec: &SpawnSpec) -> Result<ProcessInfo, ErrorResponse> {
-        if !self.is_live() {
-            return Err(ErrorResponse::with_data(
+        let closing = || {
+            ErrorResponse::with_data(
                 code::UNKNOWN_WORKSPACE,
                 format!("workspace {:?} is closing", self.id),
                 json!({"workspace": self.id}),
-            ));
+            )
+        };
+        // `closing` flips before teardown signals any children, so a spawn
+        // that still sees it unset is always re-checked below — no child
+        // can slip between the check and `terminate_all`.
+        if self.closing.is_cancelled() {
+            return Err(closing());
         }
         let info =
             self.processes
                 .spawn(spec, self.handle.runtime_dir(), self.handle.socket_name())?;
-        if !self.is_live() {
+        if self.closing.is_cancelled() {
             // Teardown raced the spawn: make sure nothing escapes.
             self.processes.terminate_all();
-            return Err(ErrorResponse::with_data(
-                code::UNKNOWN_WORKSPACE,
-                format!("workspace {:?} is closing", self.id),
-                json!({"workspace": self.id}),
-            ));
+            return Err(closing());
         }
         if let Err(err) = self.persist(None, None) {
             warn!(workspace = %self.id, "failed to persist spawn metadata: {err}");
@@ -366,14 +383,24 @@ impl Workspace {
 
     /// Attaches a named mark to the workspace's seq timeline (`mark_set`).
     ///
-    /// The mark occupies a fresh timeline point: `seq` is advanced while
-    /// the log is locked so marks stay in seq order, and the new point is
-    /// always visible to the next `get_changes_since` call rather than
-    /// hiding behind an already-reported seq.
-    pub fn set_mark(&self, name: String, metadata: Option<Value>) -> Mark {
-        let mut log = self.change_log.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        log.set_mark(name, metadata, seq, now_ms())
+    /// The mark occupies a fresh timeline point allocated on the
+    /// *compositor's* seq counter (`bump_seq`), so later compositor events
+    /// land strictly above it and stay visible to `get_changes_since` and
+    /// `wait_for_commit`. `mark_guard` serializes allocate-then-push so
+    /// concurrent `mark_set` calls keep marks in seq order.
+    pub async fn set_mark(
+        &self,
+        name: String,
+        metadata: Option<Value>,
+    ) -> Result<Mark, ErrorResponse> {
+        let _guard = self.mark_guard.lock().await;
+        let seq = self.call(|handle| handle.bump_seq()).await?.seq;
+        let mark = self
+            .change_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_mark(name, metadata, seq, now_ms());
+        Ok(mark)
     }
 
     /// Every named mark on the timeline, in seq order (`mark_list`).
@@ -466,12 +493,19 @@ impl Workspace {
         Ok(())
     }
 
-    /// Tears the workspace down: shuts the compositor (joining its thread),
-    /// stops the event pump and marks the persisted metadata closed.
+    /// Tears the workspace down: wakes/cancels in-flight waits, shuts the
+    /// compositor (joining its thread), stops the event pump and marks the
+    /// persisted metadata closed.
     ///
-    /// Blocking-friendly: callers run this inside `spawn_blocking`.
+    /// Blocking-friendly: callers run this inside `spawn_blocking`. Every
+    /// join is bounded so a wedged worker detaches (with a warning) rather
+    /// than deadlocking the close.
     fn teardown(&self, reason: &str) {
         debug!(workspace = %self.id, reason, "tearing down workspace");
+        // First: abort in-flight waits (they hold an Arc<Workspace>, so
+        // the broadcast channel never closes on its own) and fence off
+        // any concurrent spawn_process.
+        self.closing.cancel();
         // Children die first (SIGTERM, then bounded SIGKILL) while their
         // Wayland connection still works, so well-behaved apps can exit
         // cleanly.
@@ -485,7 +519,17 @@ impl Workspace {
         // senders, which ends the pump's receiver loop.
         drop(compositor);
         if let Some(pump) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = pump.join();
+            match join_bounded(pump, PUMP_JOIN_TIMEOUT) {
+                JoinOutcome::Joined => {}
+                JoinOutcome::TimedOut => warn!(
+                    workspace = %self.id,
+                    "event pump thread did not exit; detached"
+                ),
+                JoinOutcome::Panicked => warn!(
+                    workspace = %self.id,
+                    "event pump thread panicked"
+                ),
+            }
         }
         if let Err(err) = self.persist(Some(now_ms()), Some(reason)) {
             warn!(workspace = %self.id, "failed to persist close metadata: {err}");
@@ -516,9 +560,10 @@ pub struct Created {
 /// The daemon's registry of live workspaces, keyed by slug id.
 pub struct WorkspaceRegistry {
     workspaces: Mutex<HashMap<String, Arc<Workspace>>>,
-    /// Serializes `workspace_create` so concurrent creates of one id cannot
-    /// race each other past the idempotency check.
-    create_guard: tokio::sync::Mutex<()>,
+    /// Per-workspace-id lifecycle locks: `create`/`close` serialize on the
+    /// target id only, so a slow teardown of workspace A never stalls
+    /// lifecycle operations on workspace B.
+    lifecycle_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     state_dir: PathBuf,
     default_idle_ttl_ms: u64,
     /// Retained change-log events per workspace (`get_changes_since`).
@@ -530,10 +575,34 @@ impl WorkspaceRegistry {
     pub fn new(state_dir: PathBuf, default_idle_ttl: Duration, change_log_capacity: usize) -> Self {
         Self {
             workspaces: Mutex::new(HashMap::new()),
-            create_guard: tokio::sync::Mutex::new(()),
+            lifecycle_locks: Mutex::new(HashMap::new()),
             state_dir,
             default_idle_ttl_ms: default_idle_ttl.as_millis() as u64,
             change_log_capacity,
+        }
+    }
+
+    /// The per-id lifecycle mutex, created on first use.
+    fn lifecycle_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.lifecycle_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drops `id`'s lifecycle lock entry when `lock` is the last live
+    /// clone outside the map, so the map cannot grow unboundedly with the
+    /// set of ids the daemon has ever seen.
+    fn release_lifecycle_lock(&self, id: &str, lock: &Arc<tokio::sync::Mutex<()>>) {
+        // One strong ref is the map's, one is `lock` itself; anything more
+        // means another task is queueing on the same id.
+        if Arc::strong_count(lock) == 2 {
+            self.lifecycle_locks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
         }
     }
 
@@ -544,8 +613,7 @@ impl WorkspaceRegistry {
         options: WorkspaceOptions,
     ) -> Result<Created, ErrorResponse> {
         if !is_valid_slug(id) {
-            return Err(ErrorResponse::with_data(
-                code::INVALID_PARAMS,
+            return Err(ErrorResponse::invalid_params_data(
                 format!("invalid workspace id {id:?}: use 1–64 of [A-Za-z0-9_-]"),
                 json!({"id": id}),
             ));
@@ -556,7 +624,23 @@ impl WorkspaceRegistry {
             idle_ttl_ms: options.idle_ttl_ms.unwrap_or(self.default_idle_ttl_ms),
         };
 
-        let _guard = self.create_guard.lock().await;
+        // Serialize on this id only: a teardown of workspace B must not
+        // stall a create of workspace A.
+        let lock = self.lifecycle_lock(id);
+        let result = self.create_locked(id, resolved, &lock).await;
+        self.release_lifecycle_lock(id, &lock);
+        result
+    }
+
+    /// The serialized body of [`Self::create`], holding `id`'s lifecycle
+    /// lock across the check-create-insert sequence.
+    async fn create_locked(
+        &self,
+        id: &str,
+        resolved: ResolvedOptions,
+        lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Created, ErrorResponse> {
+        let _guard = lock.lock().await;
         if let Some(existing) = self.workspaces.lock().unwrap().get(id) {
             if existing.options == resolved {
                 existing.touch();
@@ -650,11 +734,26 @@ impl WorkspaceRegistry {
     /// Closes `id`: removes it from the registry, tears down its compositor
     /// and marks its persisted metadata closed.
     pub async fn close(&self, id: &str, reason: &str) -> Result<(), ErrorResponse> {
-        // Serialize with `create`: a teardown-in-flight must finish (and
-        // write its "closed" metadata) before a same-id create can return a
-        // fresh workspace that would otherwise have its "live" marker
-        // clobbered by the old teardown's write.
-        let _guard = self.create_guard.lock().await;
+        // Serialize on this id only (shared with `create`): a
+        // teardown-in-flight must finish (and write its "closed" metadata)
+        // before a same-id create can return a fresh workspace that would
+        // otherwise have its "live" marker clobbered by the old teardown's
+        // write.
+        let lock = self.lifecycle_lock(id);
+        let result = self.close_locked(id, reason, &lock).await;
+        self.release_lifecycle_lock(id, &lock);
+        result
+    }
+
+    /// The serialized body of [`Self::close`], holding `id`'s lifecycle
+    /// lock across the remove-teardown-persist sequence.
+    async fn close_locked(
+        &self,
+        id: &str,
+        reason: &str,
+        lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<(), ErrorResponse> {
+        let _guard = lock.lock().await;
         let workspace = self.workspaces.lock().unwrap().remove(id).ok_or_else(|| {
             ErrorResponse::with_data(
                 code::UNKNOWN_WORKSPACE,

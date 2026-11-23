@@ -15,15 +15,11 @@ use crate::{
     Reply,
     daemon::{
         DaemonContext,
-        protocol::{ErrorResponse, code},
+        protocol::ErrorResponse,
         registry::Workspace,
         router::{MethodDef, Scope},
     },
 };
-
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
 
 /// `status` — daemon-wide diagnostics; `{"workspace": id}` scopes the
 /// workspace detail to one workspace.
@@ -44,7 +40,7 @@ async fn status(ctx: Arc<DaemonContext>, params: Value) -> Result<Value, ErrorRe
     let params: StatusParams = if params.is_null() {
         StatusParams { workspace: None }
     } else {
-        serde_json::from_value(params).map_err(invalid_params)?
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?
     };
     let targets = match &params.workspace {
         Some(id) => vec![ctx.registry.get(id)?],

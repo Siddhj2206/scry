@@ -8,14 +8,10 @@ use serde_json::{Value, json};
 
 use crate::daemon::{
     process::SpawnSpec,
-    protocol::{ErrorResponse, code},
+    protocol::ErrorResponse,
     registry::Workspace,
     router::{MethodDef, Scope},
 };
-
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
 
 /// `spawn_app` — spawn a managed app (mutating; `readOnly` rejects it
 /// before this handler runs).
@@ -50,28 +46,26 @@ struct SpawnParams {
 }
 
 async fn spawn_app(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: SpawnParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: SpawnParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     if params.program.is_empty() {
-        return Err(ErrorResponse::new(
-            code::INVALID_PARAMS,
+        return Err(ErrorResponse::invalid_params(
             "spawn_app requires a non-empty \"program\"",
         ));
     }
     // Command::env panics on these; reject them as invalid params instead.
     for (key, value) in &params.env {
         if key.is_empty() || key.contains(['=', '\0']) {
-            return Err(ErrorResponse::new(
-                code::INVALID_PARAMS,
-                format!("invalid environment variable name {key:?}"),
-            ));
+            return Err(ErrorResponse::invalid_params(format!(
+                "invalid environment variable name {key:?}"
+            )));
         }
         if let Some(value) = value
             && value.contains('\0')
         {
-            return Err(ErrorResponse::new(
-                code::INVALID_PARAMS,
-                format!("environment value for {key:?} contains a NUL byte"),
-            ));
+            return Err(ErrorResponse::invalid_params(format!(
+                "environment value for {key:?} contains a NUL byte"
+            )));
         }
     }
 

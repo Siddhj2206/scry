@@ -167,10 +167,5 @@ fn workspace_param(params: &Value) -> Result<String, ErrorResponse> {
         .or_else(|| params.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| {
-            ErrorResponse::new(
-                code::INVALID_PARAMS,
-                "missing required \"workspace\" parameter",
-            )
-        })
+        .ok_or_else(|| ErrorResponse::invalid_params("missing required \"workspace\" parameter"))
 }

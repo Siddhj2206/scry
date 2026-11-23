@@ -25,15 +25,8 @@ use crate::{
     handle::Reply,
 };
 
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
-
 fn missing_params(what: &str) -> ErrorResponse {
-    ErrorResponse::new(
-        code::INVALID_PARAMS,
-        format!("missing required parameter {what}"),
-    )
+    ErrorResponse::invalid_params(format!("missing required parameter {what}"))
 }
 
 /// The capture encodings accepted by `capture_window`/`capture_workspace`.
@@ -48,8 +41,7 @@ impl CaptureFormat {
         match params.get("format").and_then(Value::as_str) {
             None | Some("png") => Ok(Self::Png),
             Some("webp") => Ok(Self::WebP),
-            Some(other) => Err(ErrorResponse::with_data(
-                code::INVALID_PARAMS,
+            Some(other) => Err(ErrorResponse::invalid_params_data(
                 format!("unsupported capture format {other:?}: use \"png\" or \"webp\""),
                 json!({"format": other}),
             )),
@@ -187,7 +179,8 @@ struct PlaceParams {
 }
 
 async fn place(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: PlaceParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: PlaceParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let id = params
         .window
         .map(WindowId)
@@ -195,8 +188,7 @@ async fn place(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse
 
     let (position, size) = if let Some(rect) = params.rect {
         if rect.width <= 0 || rect.height <= 0 {
-            return Err(ErrorResponse::new(
-                code::INVALID_PARAMS,
+            return Err(ErrorResponse::invalid_params(
                 "\"rect\" requires positive \"width\" and \"height\"",
             ));
         }
@@ -208,8 +200,7 @@ async fn place(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse
             (None, None) => None,
             (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
             _ => {
-                return Err(ErrorResponse::new(
-                    code::INVALID_PARAMS,
+                return Err(ErrorResponse::invalid_params(
                     "\"width\" and \"height\" must be given together and be positive",
                 ));
             }

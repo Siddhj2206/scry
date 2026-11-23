@@ -208,6 +208,12 @@ pub(crate) enum Command {
         kind: SelectionKind,
         reply: Sender<Outcome<Vec<String>>>,
     },
+    /// Reserve a fresh sequence point on the compositor's timeline.
+    ///
+    /// Daemon-side constructs that occupy the shared seq timeline (named
+    /// marks) allocate through this command so their seqs interleave
+    /// correctly with compositor events and command replies.
+    BumpSeq { reply: Sender<Outcome<()>> },
 }
 
 /// The in-process handle used to drive and observe a running [`crate::Compositor`].
@@ -577,6 +583,16 @@ impl CompositorHandle {
     /// The MIME types the current `kind` selection offers; empty when unset.
     pub fn selection_mime_types(&self, kind: SelectionKind) -> Result<Reply<Vec<String>>> {
         self.request(|reply| Command::SelectionMimeTypes { kind, reply })
+    }
+
+    /// Reserves and returns the next sequence number on the compositor's
+    /// timeline, in `reply.seq`.
+    ///
+    /// The returned seq is a real, spent timeline point: later events and
+    /// command replies are strictly greater, so a seq allocated here is a
+    /// stable boundary for `get_changes_since`/`wait_for_commit` queries.
+    pub fn bump_seq(&self) -> Result<Reply<()>> {
+        self.request(|reply| Command::BumpSeq { reply })
     }
 
     /// Shuts the compositor down: the event loop stops, all clients are

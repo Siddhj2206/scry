@@ -8,6 +8,7 @@
 //! `--no-autostart`).
 
 mod client;
+mod format;
 
 use std::{
     io::Write as _,
@@ -18,6 +19,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
+use format::{Outcome, Verb};
 use scry::daemon::{DaemonConfig, DaemonHandle};
 
 /// Process exit status: the call succeeded.
@@ -580,7 +582,7 @@ fn run_daemon(cli: &Cli) -> i32 {
 /// The dispatch half: connect, issue one verb, render the result.
 fn run_verb(cli: &Cli) -> i32 {
     let socket = cli.socket.clone().unwrap_or_else(client::default_socket);
-    let (method, params, outcome) = match build_request(&cli.command) {
+    let (verb, params, outcome) = match build_request(&cli.command) {
         Ok(request) => request,
         Err(msg) => {
             eprintln!("scry: {msg}");
@@ -592,8 +594,8 @@ fn run_verb(cli: &Cli) -> i32 {
         Ok(rpc) => rpc,
         Err(code) => return code,
     };
-    match rpc.call(method, params) {
-        Ok(result) => report(&outcome, method, &result, cli.json),
+    match rpc.call(verb.name(), params) {
+        Ok(result) => report(&outcome, verb, &result, cli.json),
         Err(client::Failure::Rpc(err)) => {
             if cli.json {
                 eprintln!(
@@ -605,7 +607,12 @@ fn run_verb(cli: &Cli) -> i32 {
                     }})
                 );
             } else {
-                eprintln!("scry: {method} failed: {} (code {})", err.message, err.code);
+                eprintln!(
+                    "scry: {} failed: {} (code {})",
+                    verb.name(),
+                    err.message,
+                    err.code
+                );
                 if let Some(data) = &err.data {
                     eprintln!("  {data}");
                 }
@@ -664,21 +671,9 @@ fn connect(cli: &Cli, socket: &Path) -> Result<client::Client, i32> {
 
 // -- request building --------------------------------------------------------------
 
-/// How a verb's result reaches the user beyond the standard formatters.
-enum Outcome {
-    /// Render with the per-verb human formatter / raw JSON.
-    Default,
-    /// `capture_*`: decode `data` and write it to a file when `--out` is
-    /// given; otherwise print the summary (human) or full JSON (`--json`).
-    Capture { out: Option<PathBuf> },
-    /// `clipboard_get`: write the decoded payload bytes to stdout in
-    /// human mode (pipe-friendly, like `wl-paste`).
-    ClipboardGet,
-}
-
-/// Maps a parsed subcommand onto `(method, params, outcome)`; CLI-side
+/// Maps a parsed subcommand onto `(verb, params, outcome)`; CLI-side
 /// validation failures become `Err(usage message)`.
-fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), String> {
+fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
     use Commands as C;
     let ws = |w: &String| json!({"workspace": w});
     Ok(match command {
@@ -692,11 +687,11 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(ttl) = args.idle_ttl_ms {
                 params["idle_ttl_ms"] = json!(ttl);
             }
-            ("workspace_create", params, Outcome::Default)
+            (Verb::WorkspaceCreate, params, Outcome::Default)
         }
-        C::Workspace(WorkspaceCommands::List) => ("workspace_list", json!({}), Outcome::Default),
+        C::Workspace(WorkspaceCommands::List) => (Verb::WorkspaceList, json!({}), Outcome::Default),
         C::Workspace(WorkspaceCommands::Close(args)) => (
-            "workspace_close",
+            Verb::WorkspaceClose,
             json!({"workspace": args.id}),
             Outcome::Default,
         ),
@@ -712,15 +707,15 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(mhz) = args.refresh_millihertz {
                 params["refresh_millihertz"] = json!(mhz);
             }
-            ("output_add", params, Outcome::Default)
+            (Verb::OutputAdd, params, Outcome::Default)
         }
         C::Output(OutputCommands::List(args)) => {
-            ("output_list", ws(&args.workspace), Outcome::Default)
+            (Verb::OutputList, ws(&args.workspace), Outcome::Default)
         }
         C::Output(OutputCommands::Remove(args)) => {
             let mut params = ws(&args.workspace);
             params["name"] = json!(args.name);
-            ("output_remove", params, Outcome::Default)
+            (Verb::OutputRemove, params, Outcome::Default)
         }
         C::Spawn(args) => {
             let mut env = serde_json::Map::new();
@@ -744,9 +739,9 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if !env.is_empty() {
                 params["env"] = Value::Object(env);
             }
-            ("spawn_app", params, Outcome::Default)
+            (Verb::SpawnApp, params, Outcome::Default)
         }
-        C::Windows(args) => ("list_windows", ws(&args.workspace), Outcome::Default),
+        C::Windows(args) => (Verb::ListWindows, ws(&args.workspace), Outcome::Default),
         C::Place(args) => {
             if args.width.is_some() != args.height.is_some() {
                 return Err("--width and --height must be given together".into());
@@ -759,10 +754,10 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
                 params["width"] = json!(w);
                 params["height"] = json!(h);
             }
-            ("place_window", params, Outcome::Default)
+            (Verb::PlaceWindow, params, Outcome::Default)
         }
         C::CaptureWindow(args) => (
-            "capture_window",
+            Verb::CaptureWindow,
             json!({
                 "workspace": args.workspace,
                 "window": args.window,
@@ -779,7 +774,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
                 params["output"] = json!(output);
             }
             (
-                "capture_workspace",
+                Verb::CaptureWorkspace,
                 params,
                 Outcome::Capture {
                     out: args.out.clone(),
@@ -792,7 +787,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(window) = args.window {
                 params["window"] = json!(window);
             }
-            ("get_damage", params, Outcome::Default)
+            (Verb::GetDamage, params, Outcome::Default)
         }
         C::Click(args) => {
             let mut params = ws(&args.workspace);
@@ -807,7 +802,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(count) = args.count {
                 params["count"] = json!(count);
             }
-            ("click", params, Outcome::Default)
+            (Verb::Click, params, Outcome::Default)
         }
         C::Drag(args) => {
             let mut params = ws(&args.workspace);
@@ -819,7 +814,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(steps) = args.steps {
                 params["steps"] = json!(steps);
             }
-            ("drag", params, Outcome::Default)
+            (Verb::Drag, params, Outcome::Default)
         }
         C::Type(args) => {
             let mut params = ws(&args.workspace);
@@ -827,7 +822,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(window) = args.window {
                 params["window"] = json!(window);
             }
-            ("type_text", params, Outcome::Default)
+            (Verb::TypeText, params, Outcome::Default)
         }
         C::Key(args) => {
             let mut params = ws(&args.workspace);
@@ -838,7 +833,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(window) = args.window {
                 params["window"] = json!(window);
             }
-            ("key_combo", params, Outcome::Default)
+            (Verb::KeyCombo, params, Outcome::Default)
         }
         C::Clipboard(ClipboardCommands::Get(args)) => {
             let mut params = ws(&args.workspace);
@@ -848,7 +843,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(mime) = &args.mime {
                 params["mime"] = json!(mime);
             }
-            ("clipboard_get", params, Outcome::ClipboardGet)
+            (Verb::ClipboardGet, params, Outcome::ClipboardGet)
         }
         C::Clipboard(ClipboardCommands::Set(args)) => {
             if args.data.is_none() && args.data_base64.is_none() {
@@ -867,7 +862,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(mime) = &args.mime {
                 params["mime"] = json!(mime);
             }
-            ("clipboard_set", params, Outcome::Default)
+            (Verb::ClipboardSet, params, Outcome::Default)
         }
         C::Wait(WaitCommands::Window(args)) => {
             if args.app_id.is_none() && args.title.is_none() && args.pid.is_none() {
@@ -889,7 +884,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(ms) = args.timeout_ms {
                 params["timeout_ms"] = json!(ms);
             }
-            ("wait_for_window", params, Outcome::Default)
+            (Verb::WaitForWindow, params, Outcome::Default)
         }
         C::Wait(WaitCommands::Commit(args)) => {
             let mut params = ws(&args.workspace);
@@ -900,7 +895,7 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(ms) = args.timeout_ms {
                 params["timeout_ms"] = json!(ms);
             }
-            ("wait_for_commit", params, Outcome::Default)
+            (Verb::WaitForCommit, params, Outcome::Default)
         }
         C::Wait(WaitCommands::Idle(args)) => {
             let mut params = ws(&args.workspace);
@@ -910,10 +905,10 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(ms) = args.timeout_ms {
                 params["timeout_ms"] = json!(ms);
             }
-            ("wait_for_idle", params, Outcome::Default)
+            (Verb::WaitForIdle, params, Outcome::Default)
         }
         C::Changes(args) => (
-            "get_changes_since",
+            Verb::GetChangesSince,
             json!({"workspace": args.workspace, "seq": args.seq}),
             Outcome::Default,
         ),
@@ -923,15 +918,17 @@ fn build_request(command: &Commands) -> Result<(&'static str, Value, Outcome), S
             if let Some(metadata) = &args.metadata {
                 params["metadata"] = metadata.clone();
             }
-            ("mark_set", params, Outcome::Default)
+            (Verb::MarkSet, params, Outcome::Default)
         }
-        C::Mark(MarkCommands::List(args)) => ("mark_list", ws(&args.workspace), Outcome::Default),
+        C::Mark(MarkCommands::List(args)) => {
+            (Verb::MarkList, ws(&args.workspace), Outcome::Default)
+        }
         C::Status(args) => {
             let params = match &args.workspace {
                 Some(id) => json!({"workspace": id}),
                 None => json!({}),
             };
-            ("status", params, Outcome::Default)
+            (Verb::Status, params, Outcome::Default)
         }
     })
 }
@@ -972,7 +969,7 @@ fn button_param(arg: &str) -> Value {
 // -- result rendering -----------------------------------------------------------------
 
 /// Prints a successful result per the outcome mode; returns the exit code.
-fn report(outcome: &Outcome, method: &str, result: &Value, json_mode: bool) -> i32 {
+fn report(outcome: &Outcome, verb: Verb, result: &Value, json_mode: bool) -> i32 {
     // File output applies in both modes before anything is printed.
     if let Outcome::Capture { out: Some(path) } = outcome {
         let bytes = result["data"]
@@ -1008,365 +1005,8 @@ fn report(outcome: &Outcome, method: &str, result: &Value, json_mode: bool) -> i
             EXIT_OK
         }
         _ => {
-            println!("{}", human(method, result, outcome));
+            println!("{}", format::render(verb, result, outcome));
             EXIT_OK
         }
     }
-}
-
-/// The human-readable rendering of one verb's result envelope.
-fn human(method: &str, r: &Value, outcome: &Outcome) -> String {
-    let seq = r["seq"].as_u64();
-    let at = seq.map(|s| format!(" (seq {s})")).unwrap_or_default();
-    match method {
-        "workspace_create" => {
-            let id = r["workspace"]["id"].as_str().unwrap_or("?");
-            if r["created"].as_bool().unwrap_or(false) {
-                format!("workspace \"{id}\" created{at}")
-            } else {
-                format!("workspace \"{id}\" already exists{at}")
-            }
-        }
-        "workspace_list" => {
-            let workspaces = r["workspaces"].as_array();
-            match workspaces {
-                None => return "no workspaces".to_string(),
-                Some(list) if list.is_empty() => return "no workspaces".to_string(),
-                _ => {}
-            }
-            workspaces
-                .unwrap()
-                .iter()
-                .map(|ws| {
-                    format!(
-                        "{}  state={}  seq={}  apps={}  socket={}",
-                        ws["id"].as_str().unwrap_or("?"),
-                        ws["state"].as_str().unwrap_or("?"),
-                        ws["seq"],
-                        ws["processes"].as_array().map(Vec::len).unwrap_or(0),
-                        ws["socket_path"].as_str().unwrap_or("?"),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        "workspace_close" => {
-            format!(
-                "workspace {:?} closed{at}",
-                r["closed"].as_str().unwrap_or("?")
-            )
-        }
-        "output_add" => {
-            let o = &r["output"];
-            format!(
-                "output {:?} {}x{}@{:.3}Hz scale={} at ({},{}){}",
-                o["name"].as_str().unwrap_or("?"),
-                o["size"][0],
-                o["size"][1],
-                o["refresh_millihertz"].as_f64().unwrap_or(0.0) / 1000.0,
-                o["scale"],
-                o["geometry"]["x"],
-                o["geometry"]["y"],
-                at,
-            )
-        }
-        "output_list" => {
-            let outputs = r["outputs"].as_array();
-            match outputs {
-                None => return "no outputs".to_string(),
-                Some(list) if list.is_empty() => return "no outputs".to_string(),
-                _ => {}
-            }
-            outputs
-                .unwrap()
-                .iter()
-                .map(|o| {
-                    format!(
-                        "{}  {}x{}@{:.3}Hz  scale={}  geometry=({},{ } {}x{})",
-                        o["name"].as_str().unwrap_or("?"),
-                        o["size"][0],
-                        o["size"][1],
-                        o["refresh_millihertz"].as_f64().unwrap_or(0.0) / 1000.0,
-                        o["scale"],
-                        o["geometry"]["x"],
-                        o["geometry"]["y"],
-                        o["geometry"]["width"],
-                        o["geometry"]["height"],
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        "output_remove" => {
-            format!(
-                "output {:?} removed{at}",
-                r["removed"].as_str().unwrap_or("?")
-            )
-        }
-        "spawn_app" => {
-            let proc = &r["process"];
-            format!(
-                "spawned {:?} pid {} {}{}",
-                proc["program"].as_str().unwrap_or("?"),
-                r["pid"],
-                proc["args"]
-                    .as_array()
-                    .map(|args| format!("args={args:?}"))
-                    .unwrap_or_default(),
-                at,
-            )
-        }
-        "list_windows" => {
-            let mut lines: Vec<String> = Vec::new();
-            if let Some(windows) = r["windows"].as_array() {
-                for w in windows {
-                    lines.push(format_window(w));
-                }
-            }
-            if let Some(popups) = r["popups"].as_array() {
-                for p in popups {
-                    lines.push(format!(
-                        "popup  surface={}  window={}  geometry=({},{} {}x{})",
-                        p["surface_id"],
-                        p["window_id"],
-                        p["geometry"]["x"],
-                        p["geometry"]["y"],
-                        p["geometry"]["width"],
-                        p["geometry"]["height"],
-                    ));
-                }
-            }
-            if lines.is_empty() {
-                "no windows".to_string()
-            } else {
-                lines.join("\n")
-            }
-        }
-        "place_window" => {
-            let w = &r["window"];
-            let g = &w["geometry"];
-            format!(
-                "window {} placed at ({},{}) {}x{}{}",
-                w["id"], g["x"], g["y"], g["width"], g["height"], at
-            )
-        }
-        "capture_window" | "capture_workspace" => {
-            let subject = if method == "capture_window" {
-                format!("window {}", r["window_id"])
-            } else {
-                format!("output {:?}", r["output"].as_str().unwrap_or("?"))
-            };
-            let size = result_data_len(r);
-            let written = match outcome {
-                Outcome::Capture { out: Some(path) } => {
-                    format!(", wrote {}", path.display())
-                }
-                _ => " (use --out FILE to save)".to_string(),
-            };
-            format!(
-                "captured {subject}: {}x{} {}, {size} bytes{written}{at}",
-                r["width"],
-                r["height"],
-                r["format"].as_str().unwrap_or("?"),
-            )
-        }
-        "get_damage" => {
-            let entries = r["damage"].as_array();
-            match entries {
-                None => return "no damage".to_string(),
-                Some(list) if list.is_empty() => return "no damage".to_string(),
-                _ => {}
-            }
-            entries
-                .unwrap()
-                .iter()
-                .map(|e| {
-                    format!(
-                        "seq={}  window={}  {}",
-                        e["seq"],
-                        e["window_id"],
-                        e["damage"]
-                            .as_array()
-                            .map(|rects| rects
-                                .iter()
-                                .map(|rc| format!(
-                                    "({},{} {}x{})",
-                                    rc["x"], rc["y"], rc["width"], rc["height"]
-                                ))
-                                .collect::<Vec<_>>()
-                                .join(" "))
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        "click" => format!(
-            "clicked {} at ({},{}) x{}{}",
-            r["button"], r["x"], r["y"], r["clicked"], at
-        ),
-        "drag" => format!(
-            "dragged {} from ({},{}) to ({},{}) in {} steps{}",
-            r["button"], r["from"]["x"], r["from"]["y"], r["to"]["x"], r["to"]["y"], r["steps"], at
-        ),
-        "type_text" => format!(
-            "typed {} characters{}",
-            r["text"].as_str().map(str::len).unwrap_or(0),
-            at
-        ),
-        "key_combo" => {
-            let mods = r["modifiers"]
-                .as_array()
-                .map(|mods| {
-                    mods.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("+")
-                })
-                .unwrap_or_default();
-            let combo = if mods.is_empty() {
-                r["key"].as_str().unwrap_or("?").to_string()
-            } else {
-                format!("{mods}+{}", r["key"].as_str().unwrap_or("?"))
-            };
-            format!("pressed {combo}{at}")
-        }
-        "clipboard_set" => format!(
-            "set {} selection: {}, {} bytes{}",
-            r["selection"].as_str().unwrap_or("clipboard"),
-            r["mime"].as_str().unwrap_or("?"),
-            r["size"],
-            at
-        ),
-        "wait_for_window" => {
-            let w = &r["window"];
-            format!("mapped {}", format_window(w))
-        }
-        "wait_for_commit" => {
-            let window = r["window_id"]
-                .as_u64()
-                .map(|id| format!(" on window {id}"))
-                .unwrap_or_default();
-            format!("commit observed{window} at seq {}", r["seq"])
-        }
-        "wait_for_idle" => {
-            format!("workspace idle after {}ms quiet{}", r["quiet_ms"], at)
-        }
-        "get_changes_since" => serde_json::to_string_pretty(r).unwrap_or_default(),
-        "mark_set" => {
-            let mark = &r["mark"];
-            format!(
-                "mark {:?} set at seq {}",
-                mark["name"].as_str().unwrap_or("?"),
-                mark["seq"]
-            )
-        }
-        "mark_list" => {
-            let marks = r["marks"].as_array();
-            match marks {
-                None => return "no marks".to_string(),
-                Some(list) if list.is_empty() => return "no marks".to_string(),
-                _ => {}
-            }
-            marks
-                .unwrap()
-                .iter()
-                .map(|m| {
-                    let meta = match m.get("metadata") {
-                        Some(Value::Null) | None => String::new(),
-                        Some(meta) => format!("  {meta}"),
-                    };
-                    format!(
-                        "seq={}  {}{}",
-                        m["seq"],
-                        m["name"].as_str().unwrap_or("?"),
-                        meta
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        "status" => format_status(r),
-        _ => serde_json::to_string_pretty(r).unwrap_or_default(),
-    }
-}
-
-/// One `list_windows` line.
-fn format_window(w: &Value) -> String {
-    let g = &w["geometry"];
-    let mut parts = vec![
-        format!("id={}", w["id"]),
-        format!(
-            "app_id={}",
-            w["app_id"]
-                .as_str()
-                .map(|s| format!("\"{s}\""))
-                .unwrap_or("-".into())
-        ),
-        format!(
-            "title={}",
-            w["title"]
-                .as_str()
-                .map(|s| format!("\"{s}\""))
-                .unwrap_or("-".into())
-        ),
-        format!("at ({},{}) {}x{}", g["x"], g["y"], g["width"], g["height"]),
-        format!("scale={}", w["scale"]),
-    ];
-    if let Some(pid) = w["pid"].as_u64() {
-        parts.push(format!("pid={pid}"));
-    }
-    if w["activated"].as_bool().unwrap_or(false) {
-        parts.push("activated".to_string());
-    }
-    parts.join("  ")
-}
-
-/// The byte length of a capture's `data` field (base64 → decoded length).
-fn result_data_len(r: &Value) -> usize {
-    r["data"]
-        .as_str()
-        .and_then(|b64| BASE64.decode(b64).ok())
-        .map(|b| b.len())
-        .unwrap_or(0)
-}
-
-/// Human rendering of `status`: the narrative plus findings and next steps.
-fn format_status(r: &Value) -> String {
-    let mut out = String::new();
-    out.push_str(r["running"].as_str().unwrap_or("scry daemon"));
-    if let Some(workspaces) = r["workspaces"].as_array() {
-        for ws in workspaces {
-            out.push_str(&format!(
-                "\n  {}: {} windows, compositor {}, {}",
-                ws["id"].as_str().unwrap_or("?"),
-                ws["window_count"],
-                ws["compositor_responsive"]
-                    .as_bool()
-                    .map(|ok| if ok { "responsive" } else { "UNRESPONSIVE" })
-                    .unwrap_or("?"),
-                ws["healthy"]
-                    .as_bool()
-                    .map(|ok| if ok { "healthy" } else { "UNHEALTHY" })
-                    .unwrap_or("?"),
-            ));
-        }
-    }
-    let findings = r["unhealthy"].as_array();
-    match findings {
-        Some(list) if !list.is_empty() => {
-            out.push_str("\nunhealthy findings:");
-            for finding in list {
-                out.push_str(&format!("\n  - {}", finding.as_str().unwrap_or("?")));
-            }
-        }
-        _ => out.push_str("\nno unhealthy findings"),
-    }
-    if let Some(steps) = r["next_steps"].as_array() {
-        out.push_str("\nnext steps:");
-        for step in steps {
-            out.push_str(&format!("\n  - {}", step.as_str().unwrap_or("?")));
-        }
-    }
-    out
 }

@@ -13,10 +13,6 @@ use crate::{
     },
 };
 
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
-
 /// `output_add` — add or reconfigure a virtual output (mutating).
 pub const ADD: MethodDef = MethodDef {
     name: "output_add",
@@ -92,13 +88,13 @@ async fn add(
     ws: Arc<crate::daemon::registry::Workspace>,
     params: Value,
 ) -> Result<Value, ErrorResponse> {
-    let params: AddParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: AddParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let size = params
         .size
         .or_else(|| params.width.zip(params.height))
         .ok_or_else(|| {
-            ErrorResponse::new(
-                code::INVALID_PARAMS,
+            ErrorResponse::invalid_params(
                 "output_add requires a mode size: \"size\": [w, h] or \"width\"+\"height\"",
             )
         })?;
@@ -133,7 +129,8 @@ async fn remove(
     ws: Arc<crate::daemon::registry::Workspace>,
     params: Value,
 ) -> Result<Value, ErrorResponse> {
-    let params: RemoveParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: RemoveParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let name = params.name.clone();
     let reply = ws.call(move |handle| handle.remove_output(&name)).await?;
     Ok(json!({

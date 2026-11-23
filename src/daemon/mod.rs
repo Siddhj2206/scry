@@ -31,8 +31,13 @@ pub use changelog::DEFAULT_CAPACITY as DEFAULT_CHANGE_LOG_CAPACITY;
 
 use std::{
     io,
+    os::fd::AsRawFd,
     path::PathBuf,
-    sync::{Arc, mpsc::channel},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::channel,
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -56,6 +61,15 @@ use crate::{
 
 /// How long [`DaemonHandle::spawn`] waits for the daemon to report ready.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Milliseconds since the Unix epoch — the daemon's shared wall-clock
+/// helper (activity watermarks, persisted metadata, process records).
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Daemon configuration.
 #[derive(Debug, Clone)]
@@ -267,6 +281,11 @@ async fn serve(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(Error::Io)?;
 
+    // Set while a reaper pass is in flight so ticks never overlap — the
+    // pass itself runs on its own task, keeping slow teardowns off the
+    // accept/signal loop. The flag clears on task exit *and* on panic, so
+    // a failed pass cannot disable the reaper permanently.
+    let reaping = Arc::new(AtomicBool::new(false));
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -277,7 +296,16 @@ async fn serve(
                     Err(err) => warn!("accept failed: {err}"),
                 }
             }
-            _ = reaper.tick() => ctx.registry.reap_idle().await,
+            _ = reaper.tick() => {
+                if !reaping.swap(true, Ordering::AcqRel) {
+                    let ctx = ctx.clone();
+                    let reaping = ReapGuard(reaping.clone());
+                    tokio::spawn(async move {
+                        ctx.registry.reap_idle().await;
+                        drop(reaping);
+                    });
+                }
+            }
             _ = &mut shutdown => break,
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
@@ -293,6 +321,20 @@ async fn serve(
     Ok(())
 }
 
+/// Clears the "reaper pass in flight" flag on drop — normal completion
+/// or panic alike.
+struct ReapGuard(Arc<AtomicBool>);
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// How often a half-closed connection re-checks whether the peer has
+/// dropped the socket entirely.
+const GONE_POLL: Duration = Duration::from_millis(50);
+
 /// Serves one client connection: newline-delimited request frames in,
 /// response frames out.
 ///
@@ -300,6 +342,12 @@ async fn serve(
 /// (event-driven waits) never head-of-line block later requests on the same
 /// connection; the socket writer is serialized behind a mutex so response
 /// frames stay whole lines.
+///
+/// A read-side EOF means the peer stopped *sending* — it does not alone
+/// prove the peer went away. `shutdown(SHUT_WR)` ("no more requests, but
+/// I'm still reading") must not cancel in-flight work, while a real
+/// disconnect must cancel it promptly; [`peer_gone`] polls the socket to
+/// tell the two apart.
 async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonContext>) {
     // `SO_PEERCRED` identifies the connecting process; requests may also
     // tag a `client_pid` param on top of it. Either signal cancels any
@@ -309,38 +357,59 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonContext>) {
         .ok()
         .and_then(|cred| cred.pid())
         .map(|pid| pid as u32);
-    // Dropped the moment the read loop ends (EOF or error): every in-flight
-    // request on this connection observes cancellation.
+    // Cancelled on real disconnect (full close, failed write, read error)
+    // or connection teardown — observed by every in-flight request.
     let conn_cancel = CancellationToken::new();
+    // Requests currently running on this connection; a half-closed
+    // connection stays open until they drain.
+    let inflight = Arc::new(AtomicUsize::new(0));
 
     let (read, write) = stream.into_split();
     let writer = Arc::new(Mutex::new(write));
     let mut lines = BufReader::new(read);
     let mut line = String::new();
+    let mut half_closed = false;
     loop {
         line.clear();
+        if half_closed {
+            // The peer can send no more requests; only in-flight responses
+            // remain. End when they drain, or sooner when the peer drops
+            // the socket entirely (POLLHUP, detected on the next poll).
+            if inflight.load(Ordering::Relaxed) == 0
+                || peer_gone(lines.get_ref().as_ref().as_raw_fd())
+            {
+                break;
+            }
+            tokio::time::sleep(GONE_POLL).await;
+            continue;
+        }
         match lines.read_line(&mut line).await {
-            Ok(0) => break, // client disconnected
+            Ok(0) if peer_gone(lines.get_ref().as_ref().as_raw_fd()) => break, // disconnect
+            Ok(0) => half_closed = true, // SHUT_WR: keep serving in-flight requests
             Ok(_) if line.len() > MAX_FRAME_BYTES => {
                 let error = ErrorResponse::new(
                     code::INVALID_REQUEST,
                     format!("request exceeds {} byte limit", MAX_FRAME_BYTES),
                 );
-                write_frame(&writer, protocol::error_frame(None, &error)).await;
+                write_frame(&writer, protocol::error_frame(None, &error), &conn_cancel).await;
             }
             Ok(_) => {
                 let frame = line.trim_end().to_string();
                 let ctx = ctx.clone();
                 let writer = writer.clone();
+                let inflight = inflight.clone();
+                let conn_cancel = conn_cancel.clone();
                 let conn = router::RequestContext {
                     cancel: conn_cancel.clone(),
                     peer_pid,
                 };
+                inflight.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let response = handle_frame(&frame, &ctx, conn).await;
                     if let Some(frame) = response {
-                        write_frame(&writer, frame).await;
+                        write_frame(&writer, frame, &conn_cancel).await;
                     }
+                    inflight.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(err) => {
@@ -350,6 +419,32 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonContext>) {
         }
     }
     conn_cancel.cancel();
+}
+
+/// Whether the peer has fully dropped its end of the connection.
+///
+/// After a read-side EOF, `poll` distinguishes a peer that half-closed
+/// (`shutdown(SHUT_WR)`: the socket is still writable — `POLLIN|POLLOUT`,
+/// no hangup) from one that closed entirely (`POLLHUP`/`POLLERR`, where
+/// writes would fail with EPIPE). In-flight requests survive the first
+/// but must abort on the second.
+#[cfg(unix)]
+fn peer_gone(fd: std::os::fd::RawFd) -> bool {
+    let mut polled = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: polls one borrowed fd with no timeout; no memory is touched.
+    let rc = unsafe { libc::poll(&mut polled, 1, 0) };
+    rc > 0 && polled.revents & (libc::POLLHUP | libc::POLLERR) != 0
+}
+
+/// Non-Unix platforms cannot probe the socket state, so an EOF is treated
+/// as a disconnect — the safe direction for releasing waits.
+#[cfg(not(unix))]
+fn peer_gone(_fd: std::os::fd::RawFd) -> bool {
+    true
 }
 
 /// Parses and dispatches one request frame; `None` means the frame was a
@@ -377,11 +472,20 @@ async fn handle_frame(
 }
 
 /// Writes one response frame (one line) on the connection.
-async fn write_frame(writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>, frame: String) {
+///
+/// A failed write means the peer went away for good: `cancel` is tripped
+/// so the connection's other in-flight requests abort instead of
+/// producing responses nobody can read.
+async fn write_frame(
+    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    frame: String,
+    cancel: &CancellationToken,
+) {
     let mut writer = writer.lock().await;
     let mut bytes = frame.into_bytes();
     bytes.push(b'\n');
     if let Err(err) = writer.write_all(&bytes).await {
         debug!("response write failed: {err}");
+        cancel.cancel();
     }
 }

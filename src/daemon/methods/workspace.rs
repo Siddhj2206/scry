@@ -8,14 +8,10 @@ use serde_json::{Value, json};
 
 use crate::daemon::{
     DaemonContext,
-    protocol::{ErrorResponse, code},
+    protocol::ErrorResponse,
     registry::WorkspaceOptions,
     router::{MethodDef, Scope},
 };
-
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
 
 /// `workspace_create` — idempotent creation keyed by an agent-chosen slug.
 pub const CREATE: MethodDef = MethodDef {
@@ -59,7 +55,8 @@ struct CreateParams {
 }
 
 async fn create(ctx: Arc<DaemonContext>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: CreateParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: CreateParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let created = ctx.registry.create(&params.id, params.options).await?;
     Ok(json!({
         "created": created.created,

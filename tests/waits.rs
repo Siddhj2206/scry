@@ -542,6 +542,81 @@ fn disconnect_cancels_wait_without_leaking_or_blocking_others() {
     assert_eq!(result["window"]["app_id"], "app");
 }
 
+#[test]
+fn workspace_close_cancels_in_flight_wait() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    create_workspace(&mut rpc, "w", json!({}));
+
+    // A blocking wait on its own connection, far inside its timeout.
+    let waiter = RpcClient::connect(&daemon.socket_path);
+    let rx = rpc_on_thread(
+        waiter,
+        "wait_for_window",
+        json!({"workspace": "w", "app_id": "never", "timeout_ms": 30_000}),
+    );
+    until_active_waits(&mut rpc, "w", 1);
+
+    // Closing the workspace out from under the wait must abort it
+    // promptly — the waiter holds the broadcast channel open, so only the
+    // workspace's closing signal can wake it before the 30s timeout.
+    rpc.call("workspace_close", json!({"workspace": "w"}));
+    let frame = rx
+        .recv_timeout(RPC_TIMEOUT)
+        .expect("wait was not cancelled by workspace_close");
+    assert_eq!(frame["error"]["code"], CANCELLED_CODE);
+}
+
+#[test]
+fn half_closed_connection_keeps_in_flight_wait() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let socket = create_workspace(&mut rpc, "w", json!({}));
+
+    // A blocking wait, then a write-side shutdown (SHUT_WR): "no more
+    // requests, still reading". This must NOT cancel the in-flight wait.
+    let mut waiter = RpcClient::connect(&daemon.socket_path);
+    waiter.send_request(
+        "wait_for_window",
+        json!({"workspace": "w", "app_id": "late.app", "timeout_ms": 30_000}),
+    );
+    until_active_waits(&mut rpc, "w", 1);
+    waiter.shutdown_write();
+
+    // Map the matching window: the wait resolves and the response is
+    // still delivered on the read half — a spurious cancellation would
+    // have produced a CANCELLED error (or torn the socket down) instead.
+    let mut client = common::TestClient::connect(&socket);
+    let _top = client.map_toplevel(64, 64, "late.app", "Late");
+    let frame = waiter.read_frame();
+    assert_eq!(frame["result"]["window"]["app_id"], "late.app");
+
+    // The connection is still fully usable from the daemon's side: the
+    // workspace lives on and the client sees a clean EOF after the reply.
+    until_active_waits(&mut rpc, "w", 0);
+}
+
+#[test]
+fn half_close_then_full_close_cancels_in_flight_wait() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    create_workspace(&mut rpc, "w", json!({}));
+
+    let mut waiter = RpcClient::connect(&daemon.socket_path);
+    waiter.send_request(
+        "wait_for_window",
+        json!({"workspace": "w", "app_id": "never", "timeout_ms": 30_000}),
+    );
+    until_active_waits(&mut rpc, "w", 1);
+
+    // SHUT_WR alone keeps the wait alive; dropping the last fd afterward
+    // is a real disconnect and must cancel it promptly.
+    waiter.shutdown_write();
+    assert_eq!(active_waits(&mut rpc, "w"), 1);
+    drop(waiter);
+    until_active_waits(&mut rpc, "w", 0);
+}
+
 // -- readOnly ----------------------------------------------------------------
 
 #[test]

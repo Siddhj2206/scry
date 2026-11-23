@@ -484,6 +484,67 @@ fn drag_delivers_motion_between_press_and_release() {
     }
 }
 
+/// Regression: an out-of-bounds `to` must be rejected *before* the
+/// pointer button is pressed — a failure mid-drag used to leave a
+/// dangling pressed button on the client.
+#[test]
+fn drag_rejects_bad_endpoints_without_pressing() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let socket = create_workspace(&mut rpc, "dragerrs", json!({}));
+
+    let mut client = TestClient::connect(&socket);
+    let _toplevel = client.map_toplevel(100, 100, "org.scry.DragErrs", "DragErrs");
+    client.roundtrip();
+
+    // `to` is window-local but outside the 100x100 window: the drag must
+    // fail with a structured error before any button event is delivered.
+    let err = rpc.call_err(
+        "drag",
+        json!({
+            "workspace": "dragerrs",
+            "from": {"x": 10.0, "y": 10.0},
+            "to": {"x": 500.0, "y": 500.0, "window": 1},
+        }),
+    );
+    assert_eq!(err.code, -32602);
+
+    client.roundtrip();
+    client.roundtrip();
+    assert!(
+        client.state.pointer_buttons.is_empty(),
+        "drag left a dangling press on the client: {:?}",
+        client.state.pointer_buttons
+    );
+
+    // A bad `from` (window-local, out of bounds) fails the same way.
+    let err = rpc.call_err(
+        "drag",
+        json!({
+            "workspace": "dragerrs",
+            "from": {"x": -5.0, "y": 500.0, "window": 1},
+            "to": {"x": 10.0, "y": 10.0},
+        }),
+    );
+    assert_eq!(err.code, -32602);
+    client.roundtrip();
+    assert!(client.state.pointer_buttons.is_empty());
+
+    // And a valid drag still works afterwards: the pointer is not stuck
+    // holding the button down from the failed attempts.
+    rpc.call(
+        "drag",
+        json!({
+            "workspace": "dragerrs",
+            "from": {"x": 10.0, "y": 10.0},
+            "to": {"x": 50.0, "y": 50.0},
+        }),
+    );
+    client.pump_until(|s| s.pointer_buttons.len() >= 2);
+    assert_eq!(client.state.pointer_buttons[0], (BTN_LEFT, 1));
+    assert_eq!(client.state.pointer_buttons[1], (BTN_LEFT, 0));
+}
+
 // -- keyboard verbs -----------------------------------------------------------
 
 #[test]

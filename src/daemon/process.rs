@@ -13,14 +13,17 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
 use serde_json::json;
 use tracing::warn;
 
-use crate::daemon::protocol::{ErrorResponse, code};
+use crate::daemon::{
+    now_ms,
+    protocol::{ErrorResponse, code},
+};
 
 /// Grace period between SIGTERM and SIGKILL during teardown.
 const TERM_GRACE: Duration = Duration::from_secs(2);
@@ -28,14 +31,6 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Poll cadence while waiting for managed children to exit.
 const REAP_POLL: Duration = Duration::from_millis(10);
-
-/// Milliseconds since the Unix epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// The default Wayland + `wl_shm` + AT-SPI environment profile injected
 /// into every spawned app (before caller overrides). `XDG_RUNTIME_DIR` and
@@ -141,6 +136,10 @@ impl ProcessRegistry {
         command
             .args(&spec.args)
             .stdin(Stdio::null())
+            // Children must never hold the daemon's own stdout/stderr
+            // pipes open (e.g. a daemonized app outliving the workspace).
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .env("XDG_RUNTIME_DIR", runtime_dir)
             .env("WAYLAND_DISPLAY", wayland_display)
             .env_remove("DISPLAY");
@@ -248,18 +247,21 @@ impl ProcessRegistry {
         infos
     }
 
-    /// Terminates every still-running child: SIGTERM to each process
+    /// Terminates every tracked child's process group: SIGTERM to each
     /// group, a bounded grace period, then SIGKILL to whatever survives.
     ///
-    /// Blocks until all children are reaped (bounded by
-    /// [`TERM_GRACE`] + [`KILL_GRACE`]); safe to call from a
+    /// Every tracked pid is signalled — including records whose leader
+    /// already exited, because a daemonizing app (e.g. `wl-copy` without
+    /// `--foreground`) can leave live grandchildren in its process group
+    /// after the leader is reaped. Blocks until all children are reaped
+    /// (bounded by [`TERM_GRACE`] + [`KILL_GRACE`]); safe to call from a
     /// `spawn_blocking` teardown path.
     pub fn terminate_all(&self) {
-        let running = self.running_pids();
-        if running.is_empty() {
+        let tracked = self.pids();
+        if tracked.is_empty() {
             return;
         }
-        for pid in &running {
+        for pid in &tracked {
             signal_tree(*pid, libc::SIGTERM);
         }
         if self.await_all_exit(TERM_GRACE) {
@@ -267,6 +269,8 @@ impl ProcessRegistry {
         }
         for pid in self.running_pids() {
             warn!(pid, "managed child ignored SIGTERM; sending SIGKILL");
+        }
+        for pid in self.pids() {
             signal_tree(pid, libc::SIGKILL);
         }
         if !self.await_all_exit(KILL_GRACE) {

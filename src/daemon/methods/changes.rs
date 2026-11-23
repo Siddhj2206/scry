@@ -7,14 +7,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::daemon::{
-    protocol::{ErrorResponse, code},
+    protocol::ErrorResponse,
     registry::Workspace,
     router::{MethodDef, Scope},
 };
-
-fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
-    ErrorResponse::new(code::INVALID_PARAMS, format!("invalid params: {err}"))
-}
 
 /// `get_changes_since` — compact deduplicated diff over `(seq, current]`.
 pub const GET_CHANGES_SINCE: MethodDef = MethodDef {
@@ -26,7 +22,7 @@ pub const GET_CHANGES_SINCE: MethodDef = MethodDef {
                 .workspace
                 .expect("workspace scope resolves a workspace");
             let params: ChangesParams =
-                serde_json::from_value(call.params).map_err(invalid_params)?;
+                serde_json::from_value(call.params).map_err(ErrorResponse::invalid_params)?;
             let mut diff = ws.changes_since(params.seq);
             // The envelope's `seq` is the workspace's current seq: pin it to
             // the same watermark the diff was computed against.
@@ -82,21 +78,20 @@ struct MarkSetParams {
 }
 
 async fn mark_set(ws: Arc<Workspace>, params: Value) -> Result<Value, ErrorResponse> {
-    let params: MarkSetParams = serde_json::from_value(params).map_err(invalid_params)?;
+    let params: MarkSetParams =
+        serde_json::from_value(params).map_err(ErrorResponse::invalid_params)?;
     let name = params.name.trim();
     if name.is_empty() {
-        return Err(ErrorResponse::new(
-            code::INVALID_PARAMS,
+        return Err(ErrorResponse::invalid_params(
             "mark_set requires a non-empty \"name\"",
         ));
     }
     if name.chars().count() > 128 {
-        return Err(ErrorResponse::new(
-            code::INVALID_PARAMS,
+        return Err(ErrorResponse::invalid_params(
             "mark names are limited to 128 characters",
         ));
     }
-    let mark = ws.set_mark(name.to_string(), params.metadata);
+    let mark = ws.set_mark(name.to_string(), params.metadata).await?;
     Ok(json!({
         "mark": mark,
         "seq": mark.seq,

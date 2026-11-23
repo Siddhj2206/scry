@@ -392,6 +392,55 @@ fn marks_attach_to_the_seq_timeline_in_order() {
     assert_eq!(listed["marks"], json!([]));
 }
 
+/// Regression: `mark_set` allocates its seq on the *compositor's* own
+/// timeline, so events committed right after a mark land at strictly
+/// greater seqs instead of being silently skipped by `> since` filters.
+#[test]
+fn mark_set_leaves_subsequent_events_visible() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (socket_path, _) = create_workspace(&mut rpc, "seqmarks");
+
+    let marked = rpc.call(
+        "mark_set",
+        json!({"workspace": "seqmarks", "name": "boundary"}),
+    );
+    let mark_seq = marked["mark"]["seq"].as_u64().unwrap();
+
+    // Commits landing immediately after the mark: a window maps and
+    // commits, producing compositor events at seqs above mark_seq.
+    let mut client = TestClient::connect(&socket_path);
+    let top = client.map_toplevel(120, 80, "post-mark", "Post Mark");
+    let buffer = client.shm_buffer(120, 80, 0xff22_8844);
+    top.surface.attach(Some(&buffer), 0, 0);
+    top.surface.commit();
+    client.roundtrip();
+
+    // wait_for_commit(after_seq = mark_seq) resolves — the post-mark
+    // commits are strictly newer than the mark's own timeline point.
+    let result = rpc.call(
+        "wait_for_commit",
+        json!({"workspace": "seqmarks", "after_seq": mark_seq, "timeout_ms": 5_000}),
+    );
+    let commit_seq = result["seq"].as_u64().unwrap();
+    assert!(
+        commit_seq > mark_seq,
+        "commit landed at seq {commit_seq}, not above mark_seq {mark_seq}"
+    );
+
+    // get_changes_since(mark_seq) sees the same events: the mapped window
+    // shows up in the diff rather than hiding behind the mark's seq.
+    let diff = get_changes_until(&mut rpc, "seqmarks", mark_seq, |d| {
+        !d["windows"]["mapped"].as_array().unwrap().is_empty()
+    });
+    assert_eq!(diff["windows"]["mapped"][0]["app_id"], "post-mark");
+    let damage = diff["damage"].as_array().unwrap();
+    assert!(
+        !damage.is_empty(),
+        "post-mark commit damage missing from diff: {diff}"
+    );
+}
+
 #[test]
 fn status_reports_a_healthy_daemon_and_workspaces() {
     let daemon = spawn_daemon();

@@ -110,6 +110,25 @@ impl RpcClient {
         self.request_frame(id, method, params)
     }
 
+    /// Half-closes the connection: shuts the socket's write side so no
+    /// more requests can be sent, while the read side stays open for
+    /// in-flight responses.
+    pub fn shutdown_write(&mut self) {
+        self.writer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("failed to shutdown write half");
+    }
+
+    /// Reads one response frame, without sending a request first — used
+    /// after [`Self::send_request`] or a [`Self::shutdown_write`].
+    pub fn read_frame(&mut self) -> Value {
+        let mut line = String::new();
+        self.reader
+            .read_line(&mut line)
+            .expect("failed to read response");
+        serde_json::from_str(&line).expect("response was not valid JSON")
+    }
+
     /// Writes a request without reading any response, returning the id used.
     ///
     /// For blocking verbs (waits): the caller observes the in-flight request

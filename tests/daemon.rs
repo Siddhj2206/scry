@@ -369,6 +369,106 @@ fn read_only_workspaces_reject_mutations_but_allow_reads() {
     rpc.call("workspace_close", json!({"workspace": "frozen"}));
 }
 
+/// Regression: a workspace whose teardown is slow (its app ignores
+/// SIGTERM, burning the 2s termination grace) must not stall lifecycle
+/// operations on *other* workspaces — create/close serialize per id, not
+/// globally.
+#[test]
+fn slow_teardown_does_not_stall_other_workspace_creates() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+
+    rpc.call("workspace_create", json!({"id": "heavy"}));
+    // A child that ignores SIGTERM: teardown burns the full ~2s term
+    // grace before escalating to SIGKILL.
+    rpc.call(
+        "spawn_app",
+        json!({
+            "workspace": "heavy",
+            "program": "sh",
+            "args": ["-c", "trap '' TERM; while :; do sleep 60; done"],
+        }),
+    );
+
+    // Close on a helper thread; wait until "heavy" is out of the registry
+    // — from then on its multi-second teardown is in flight.
+    let socket_path = daemon.socket_path.clone();
+    let closer = std::thread::spawn(move || {
+        let mut rpc = RpcClient::connect(&socket_path);
+        rpc.call("workspace_close", json!({"workspace": "heavy"}));
+    });
+    let deadline = std::time::Instant::now() + RPC_TIMEOUT;
+    loop {
+        let listed = rpc.call("workspace_list", json!({}));
+        if listed["workspaces"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "heavy workspace never left the registry"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // With per-id serialization the create is bounded by compositor
+    // spawn time (~100ms), not the ~2s term grace a global lock would
+    // force it to outwait.
+    let start = std::time::Instant::now();
+    rpc.call("workspace_create", json!({"id": "light"}));
+    assert!(
+        start.elapsed() < Duration::from_millis(1_500),
+        "create stalled behind an unrelated teardown: {:?}",
+        start.elapsed()
+    );
+    closer.join().expect("close thread panicked");
+}
+
+/// Regression: the idle reaper runs off the accept loop, so a slow
+/// idle-ttl teardown cannot stall `accept()` for new clients.
+#[test]
+fn slow_reaper_teardown_does_not_stall_new_connections() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+
+    rpc.call(
+        "workspace_create",
+        json!({"id": "ephemeral-heavy", "idle_ttl_ms": 150}),
+    );
+    rpc.call(
+        "spawn_app",
+        json!({
+            "workspace": "ephemeral-heavy",
+            "program": "sh",
+            "args": ["-c", "trap '' TERM; while :; do sleep 60; done"],
+        }),
+    );
+
+    // Wait until the reaper removes the workspace: its ~2s teardown is
+    // then in flight, and accept() must still serve a fresh client.
+    let deadline = std::time::Instant::now() + RPC_TIMEOUT;
+    loop {
+        let listed = rpc.call("workspace_list", json!({}));
+        if listed["workspaces"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reaper never removed the expired workspace"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let start = std::time::Instant::now();
+    let mut fresh = RpcClient::connect(&daemon.socket_path);
+    let listed = fresh.call("workspace_list", json!({}));
+    assert_eq!(listed["workspaces"], json!([]));
+    assert!(
+        start.elapsed() < Duration::from_millis(1_500),
+        "new client stalled behind the reaper's teardown: {:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn idle_reaper_closes_only_expired_workspaces() {
     let daemon = spawn_daemon();

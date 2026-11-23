@@ -326,6 +326,81 @@ fn workspace_close_terminates_spawned_children() {
     wait_for_exit(grandchild_pid);
 }
 
+/// Regression: a daemonizing app whose leader exits 0 (like `wl-copy`
+/// without `--foreground`) must not leave its background children behind
+/// in the tracked process group — teardown signals every tracked group,
+/// not only groups whose leader is still running.
+#[test]
+fn workspace_close_kills_children_of_exited_leaders() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+
+    rpc.call("workspace_create", json!({"id": "daemonize"}));
+
+    // The leader forks a grandchild into its own process group, records
+    // the grandchild's pid, and exits 0 — the leader is reaped while the
+    // group lives on.
+    let gc_file = daemon.dir.path().join("grandchild.pid");
+    let leader = rpc.call(
+        "spawn_app",
+        json!({
+            "workspace": "daemonize",
+            "program": "sh",
+            "args": ["-c", "sleep 300 & echo $! > \"$1\"", "sh", gc_file.to_str().unwrap()],
+        }),
+    );
+    let leader_pid = leader["pid"].as_u64().unwrap();
+    let grandchild_pid: u64 = wait_for_file(&gc_file).trim().parse().unwrap();
+
+    // Wait until the leader is reaped: only now is the bug reachable —
+    // signalling only "running" children would miss this whole group.
+    wait_for_workspace(&mut rpc, "daemonize", |entry| {
+        entry["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pid"].as_u64() == Some(leader_pid))
+            .is_some_and(|p| p["state"] == "exited")
+    });
+    assert!(
+        PathBuf::from(format!("/proc/{grandchild_pid}")).exists(),
+        "grandchild should still be running before close"
+    );
+
+    rpc.call("workspace_close", json!({"workspace": "daemonize"}));
+    wait_for_exit(grandchild_pid);
+}
+
+#[test]
+fn spawn_app_children_do_not_hold_daemon_stdio() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+
+    rpc.call("workspace_create", json!({"id": "stdio"}));
+
+    // Write to stdout and stderr inside the child: with Stdio::null()
+    // these are silently discarded instead of keeping daemon pipes open.
+    rpc.call(
+        "spawn_app",
+        json!({
+            "workspace": "stdio",
+            "program": "sh",
+            "args": ["-c", "echo out; echo err >&2; exit 0"],
+        }),
+    );
+
+    // The daemon stays responsive and the child exits normally.
+    wait_for_workspace(&mut rpc, "stdio", |entry| {
+        entry["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["state"] == "exited")
+    });
+    let listed = rpc.call("workspace_list", json!({}));
+    assert_eq!(listed["workspaces"].as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn daemon_shutdown_terminates_spawned_children() {
     let mut daemon = spawn_daemon();
