@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use smithay::{
     desktop::{Space, Window},
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
@@ -41,7 +42,7 @@ pub(crate) fn default_output_spec() -> OutputSpec {
 /// `size` is the advertised mode's physical pixel size; the output's logical
 /// size inside the compositor [`Space`] is `size / scale`. A 3840x2160 mode
 /// with `scale: 2.0` therefore presents a 1920x1080 logical output to clients.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputSpec {
     /// `wl_output.name`; also the stable key identifying the output for
     /// updates and removal.
@@ -60,7 +61,7 @@ pub struct OutputSpec {
 }
 
 /// A snapshot of a virtual output's current configuration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OutputInfo {
     /// `wl_output.name`.
     pub name: String,

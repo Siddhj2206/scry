@@ -49,6 +49,8 @@
 
 mod clipboard;
 mod compositor;
+/// The control daemon: Unix-socket JSON-RPC 2.0 API and workspace lifecycle.
+pub mod daemon;
 mod error;
 mod event;
 mod frame;
