@@ -54,6 +54,11 @@ pub mod code {
     /// exact name changed, or the snapshot it came from was evicted. The
     /// caller must take a fresh `get_tree` snapshot.
     pub const STALE_REF: i64 = -32010;
+    /// A `tree_diff` baseline (`from_snapshot`) is unknown to the
+    /// workspace or has been evicted from its bounded snapshot history —
+    /// or no baseline exists yet. The caller must capture a fresh
+    /// `get_tree` snapshot to diff against.
+    pub const SNAPSHOT_EVICTED: i64 = -32011;
 }
 
 /// A decoded JSON-RPC request.

@@ -136,7 +136,7 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
     let pids = watched_pids(client_pid, call.peer_pid);
     let capture = tokio::select! {
         reason = cancel_reason(&call.cancel, &ws, &pids) => {
-            return Err(cancelled(reason));
+            return Err(cancelled("get_tree", reason));
         }
         capture = a11y::capture(
             ws.a11y_address(),
@@ -197,7 +197,7 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
 }
 
 /// Reads `name` as a positive integer bound (`≥1`), defaulting to `None`.
-fn bounded_param(params: &Value, name: &str) -> Result<Option<usize>, ErrorResponse> {
+pub(crate) fn bounded_param(params: &Value, name: &str) -> Result<Option<usize>, ErrorResponse> {
     match params.get(name).and_then(Value::as_u64) {
         None => Ok(None),
         Some(0) => Err(ErrorResponse::invalid_params(format!(
@@ -288,17 +288,21 @@ fn stale_ref_error(
 }
 
 /// A `CANCELLED` error for an aborted capture.
-fn cancelled(reason: &'static str) -> ErrorResponse {
+pub(crate) fn cancelled(verb: &'static str, reason: &'static str) -> ErrorResponse {
     ErrorResponse::with_data(
         code::CANCELLED,
-        format!("get_tree cancelled: {reason}"),
-        json!({"verb": "get_tree", "reason": reason}),
+        format!("{verb} cancelled: {reason}"),
+        json!({"verb": verb, "reason": reason}),
     )
 }
 
 /// Resolves to the cancellation reason as soon as the connection drops,
 /// the workspace starts teardown, or a watched pid exits.
-async fn cancel_reason(cancel: &CancellationToken, ws: &Workspace, pids: &[u32]) -> &'static str {
+pub(crate) async fn cancel_reason(
+    cancel: &CancellationToken,
+    ws: &Workspace,
+    pids: &[u32],
+) -> &'static str {
     let mut liveness = tokio::time::interval(crate::daemon::LIVENESS_INTERVAL);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let ws_closing = ws.closing_token();

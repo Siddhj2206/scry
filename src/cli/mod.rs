@@ -107,6 +107,10 @@ enum Commands {
     Wait(WaitCommands),
     /// Fused compositor + AT-SPI2 accessibility tree snapshot.
     Tree(TreeArgs),
+    /// Search the fused accessibility tree by role/name/text/state.
+    TreeFind(TreeFindArgs),
+    /// Diff a prior tree snapshot against the live accessibility tree.
+    TreeDiff(TreeDiffArgs),
     /// Click a fused accessibility node by its `eN` ref.
     ClickNode(ClickNodeArgs),
     /// Invoke an AT-SPI2 action on a fused node by its `eN` ref.
@@ -528,6 +532,63 @@ struct TreeArgs {
     max_nodes: Option<u64>,
     /// Bound the a11y capture in milliseconds; open branches degrade
     /// into `- ... deadline exceeded` notes.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct TreeFindArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Restrict the search to one window id.
+    #[arg(long)]
+    window: Option<u64>,
+    /// Match the node's accessible role name exactly.
+    #[arg(long, value_name = "ROLE")]
+    role: Option<String>,
+    /// Match the node's accessible name.
+    #[arg(long, value_name = "TEXT")]
+    name: Option<String>,
+    /// Match the node's Text/Value contents.
+    #[arg(long, value_name = "TEXT")]
+    text: Option<String>,
+    /// "substring" (default) or "exact" name/text matching.
+    #[arg(long, value_parser = ["substring", "exact"])]
+    r#match: Option<String>,
+    /// Require this AT-SPI state on the node (repeatable).
+    #[arg(long, value_name = "STATE")]
+    state: Vec<String>,
+    /// Canonical context lines before/after each match (default 2).
+    #[arg(long, value_name = "N")]
+    context: Option<u64>,
+    /// Maximum descent depth (default 64).
+    #[arg(long, value_name = "N")]
+    max_depth: Option<u64>,
+    /// Maximum nodes emitted (default 10000).
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<u64>,
+    /// Bound the a11y capture in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct TreeDiffArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// The baseline snapshot id (default: the workspace's latest
+    /// snapshot).
+    #[arg(long, value_name = "ID")]
+    from: Option<u64>,
+    /// Maximum descent depth (default 64).
+    #[arg(long, value_name = "N")]
+    max_depth: Option<u64>,
+    /// Maximum nodes emitted (default 10000).
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<u64>,
+    /// Bound the a11y capture in milliseconds.
     #[arg(long, value_name = "MS")]
     deadline_ms: Option<u64>,
 }
@@ -1043,6 +1104,56 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
                 params["deadline_ms"] = json!(ms);
             }
             (Verb::GetTree, params, Outcome::Default)
+        }
+        C::TreeFind(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(window) = args.window {
+                params["window_id"] = json!(window);
+            }
+            if let Some(role) = &args.role {
+                params["role"] = json!(role);
+            }
+            if let Some(name) = &args.name {
+                params["name"] = json!(name);
+            }
+            if let Some(text) = &args.text {
+                params["text"] = json!(text);
+            }
+            if let Some(r#match) = &args.r#match {
+                params["match"] = json!(r#match);
+            }
+            if !args.state.is_empty() {
+                params["state"] = json!(args.state);
+            }
+            if let Some(context) = args.context {
+                params["context"] = json!(context);
+            }
+            if let Some(depth) = args.max_depth {
+                params["max_depth"] = json!(depth);
+            }
+            if let Some(nodes) = args.max_nodes {
+                params["max_nodes"] = json!(nodes);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::TreeFind, params, Outcome::Default)
+        }
+        C::TreeDiff(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(from) = args.from {
+                params["from_snapshot"] = json!(from);
+            }
+            if let Some(depth) = args.max_depth {
+                params["max_depth"] = json!(depth);
+            }
+            if let Some(nodes) = args.max_nodes {
+                params["max_nodes"] = json!(nodes);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::TreeDiff, params, Outcome::Default)
         }
         C::ClickNode(args) => {
             let mut params = ws(&args.workspace);

@@ -22,6 +22,7 @@
 
 pub mod a11y;
 pub mod bus;
+pub mod canon;
 mod changelog;
 pub mod methods;
 pub mod portal;

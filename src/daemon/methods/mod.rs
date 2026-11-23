@@ -7,6 +7,7 @@
 pub mod changes;
 pub mod input;
 pub mod node;
+pub mod observe;
 pub mod output;
 pub mod portal;
 pub mod spawn;

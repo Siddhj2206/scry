@@ -219,6 +219,8 @@ pub struct FakePeer {
     pub root_path: String,
     conn: zbus::blocking::Connection,
     nodes: Nodes,
+    /// Monotonic suffix for paths of nodes added after `serve`.
+    added: std::sync::atomic::AtomicUsize,
 }
 
 impl FakePeer {
@@ -269,6 +271,57 @@ impl FakePeer {
     pub fn invoked_actions(&self, path: &str) -> Vec<String> {
         let node = self.node(path);
         node.lock().unwrap().invoked.clone()
+    }
+
+    /// Changes a served node's `Text` contents — drives `tree_diff`
+    /// changed-line hunks.
+    pub fn set_text(&self, path: &str, text: &str) {
+        let node = self.node(path);
+        node.lock().unwrap().text = Some(text.to_string());
+    }
+
+    /// Replaces a served node's AT-SPI state names — drives `tree_diff`
+    /// hunks for pure state flips (checked, focused) that leave role,
+    /// name and bounds alone.
+    pub fn set_states(&self, path: &str, states: &[&str]) {
+        let node = self.node(path);
+        node.lock().unwrap().states =
+            state_words(&states.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    }
+
+    /// Serves `node` (and its subtree) as a new child of `parent_path`,
+    /// inserted at `index` (clamped to the end). Returns the new node's
+    /// object path — the `tree_diff` added-lines path.
+    pub fn insert_child(&self, parent_path: &str, index: usize, node: FakeNode) -> String {
+        let suffix = self
+            .added
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = format!("{parent_path}/added{suffix}");
+        serve_node_tree(
+            &self.conn,
+            &self.nodes,
+            &self.bus_name,
+            &self.root_path,
+            &path,
+            &node,
+            Some(parent_path),
+        );
+        let parent = self.node(parent_path);
+        let mut parent = parent.lock().unwrap();
+        let index = index.min(parent.children.len());
+        parent.children.insert(
+            index,
+            (
+                self.bus_name.clone(),
+                OwnedObjectPath::try_from(path.clone()).unwrap(),
+            ),
+        );
+        path
+    }
+
+    /// `insert_child` at the end of the parent's child list.
+    pub fn add_child(&self, parent_path: &str, node: FakeNode) -> String {
+        self.insert_child(parent_path, usize::MAX, node)
     }
 }
 
@@ -327,21 +380,98 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
 
     let nodes: Nodes = Arc::new(Mutex::new(HashMap::new()));
     for (path, node, parent) in &flat {
+        serve_one(
+            &conn,
+            &nodes,
+            &unique,
+            &root_path,
+            path,
+            node,
+            parent.as_deref(),
+        );
+    }
+
+    // The app root also implements `org.a11y.atspi.Application` — the
+    // registry sets `Id` on it during the Embed handshake.
+    conn.object_server()
+        .at(root_path.as_str(), FakeApplication::default())
+        .expect("failed to serve application interface");
+
+    let plug_path = ObjectPath::try_from(root_path.as_str()).unwrap();
+    let reply = conn
+        .call_method(
+            Some(REGISTRY_NAME),
+            REGISTRY_ROOT,
+            Some("org.a11y.atspi.Socket"),
+            "Embed",
+            &((unique.as_str(), &plug_path),),
+        )
+        .expect("Socket::Embed failed");
+    let _socket: (String, OwnedObjectPath) = reply.body().deserialize().unwrap();
+
+    FakePeer {
+        bus_name: unique,
+        root_path,
+        conn,
+        nodes,
+        added: std::sync::atomic::AtomicUsize::new(0),
+    }
+}
+
+/// Serves `node` and its whole subtree on `conn`, registering every node
+/// into `nodes` — shared by `serve`'s initial tree and `insert_child`'s
+/// runtime additions.
+fn serve_node_tree(
+    conn: &zbus::blocking::Connection,
+    nodes: &Nodes,
+    unique: &str,
+    root_path: &str,
+    path: &str,
+    node: &FakeNode,
+    parent: Option<&str>,
+) {
+    serve_one(conn, nodes, unique, root_path, path, node, parent);
+    for (index, child) in node.children.iter().enumerate() {
+        serve_node_tree(
+            conn,
+            nodes,
+            unique,
+            root_path,
+            &format!("{path}/{index}"),
+            child,
+            Some(path),
+        );
+    }
+}
+
+/// Registers one node's state and interfaces on `conn` and inserts it
+/// into `nodes`. `parent` is the node's parent object path (`None` on
+/// the application root).
+fn serve_one(
+    conn: &zbus::blocking::Connection,
+    nodes: &Nodes,
+    unique: &str,
+    root_path: &str,
+    path: &str,
+    node: &FakeNode,
+    parent: Option<&str>,
+) {
+    {
         let children: Vec<(String, OwnedObjectPath)> = node
             .children
             .iter()
             .enumerate()
             .map(|(i, _)| {
                 (
-                    unique.clone(),
+                    unique.to_string(),
                     OwnedObjectPath::try_from(format!("{path}/{i}")).unwrap(),
                 )
             })
             .collect();
         let parent_ref = match parent {
             Some(parent) => (
-                unique.clone(),
-                OwnedObjectPath::try_from(parent.as_str()).unwrap(),
+                unique.to_string(),
+                OwnedObjectPath::try_from(parent).unwrap(),
             ),
             None => (String::new(), OwnedObjectPath::try_from(NULL_PATH).unwrap()),
         };
@@ -369,7 +499,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
             value_text: node.value_text.clone(),
             delay: Duration::from_millis(node.delay_ms),
             children,
-            parent_path: parent.clone(),
+            parent_path: parent.map(str::to_string),
             interfaces,
             actions: node
                 .actions
@@ -383,16 +513,19 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
             invoked: Vec::new(),
             removed: false,
         }));
-        nodes.lock().unwrap().insert(path.clone(), state.clone());
+        nodes
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), state.clone());
         conn.object_server()
             .at(
-                path.as_str(),
+                path,
                 FakeAccessible {
-                    unique: unique.clone(),
+                    unique: unique.to_string(),
                     parent: parent_ref,
                     app: (
-                        unique.clone(),
-                        OwnedObjectPath::try_from(root_path.as_str()).unwrap(),
+                        unique.to_string(),
+                        OwnedObjectPath::try_from(root_path).unwrap(),
                     ),
                     state: state.clone(),
                 },
@@ -401,7 +534,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         if node.bounds.is_some() {
             conn.object_server()
                 .at(
-                    path.as_str(),
+                    path,
                     FakeComponent {
                         state: state.clone(),
                     },
@@ -411,7 +544,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         if node.text.is_some() {
             conn.object_server()
                 .at(
-                    path.as_str(),
+                    path,
                     FakeText {
                         state: state.clone(),
                     },
@@ -421,7 +554,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         if node.value.is_some() {
             conn.object_server()
                 .at(
-                    path.as_str(),
+                    path,
                     FakeValue {
                         state: state.clone(),
                     },
@@ -430,34 +563,9 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         }
         if !node.actions.is_empty() {
             conn.object_server()
-                .at(path.as_str(), FakeAction { state })
+                .at(path, FakeAction { state })
                 .unwrap_or_else(|e| panic!("failed to serve {path} action: {e}"));
         }
-    }
-
-    // The app root also implements `org.a11y.atspi.Application` — the
-    // registry sets `Id` on it during the Embed handshake.
-    conn.object_server()
-        .at(root_path.as_str(), FakeApplication::default())
-        .expect("failed to serve application interface");
-
-    let plug_path = ObjectPath::try_from(root_path.as_str()).unwrap();
-    let reply = conn
-        .call_method(
-            Some(REGISTRY_NAME),
-            REGISTRY_ROOT,
-            Some("org.a11y.atspi.Socket"),
-            "Embed",
-            &((unique.as_str(), &plug_path),),
-        )
-        .expect("Socket::Embed failed");
-    let _socket: (String, OwnedObjectPath) = reply.body().deserialize().unwrap();
-
-    FakePeer {
-        bus_name: unique,
-        root_path,
-        conn,
-        nodes,
     }
 }
 
