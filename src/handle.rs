@@ -14,6 +14,7 @@ use std::{
 use smithay::reexports::calloop::channel::Sender as CommandSender;
 
 use crate::{
+    clipboard::SelectionKind,
     error::{Error, Result},
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
 };
@@ -62,6 +63,29 @@ pub(crate) enum Command {
     CloseWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
+    },
+    /// Install a compositor-provided selection (clipboard or primary).
+    SetSelection {
+        kind: SelectionKind,
+        mime: String,
+        data: Vec<u8>,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Clear a selection (clipboard or primary).
+    ClearSelection {
+        kind: SelectionKind,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Read a selection's contents negotiated to `mime`.
+    ReadSelection {
+        kind: SelectionKind,
+        mime: String,
+        reply: Sender<Outcome<Vec<u8>>>,
+    },
+    /// List the MIME types a selection currently offers.
+    SelectionMimeTypes {
+        kind: SelectionKind,
+        reply: Sender<Outcome<Vec<String>>>,
     },
 }
 
@@ -142,6 +166,49 @@ impl CompositorHandle {
     /// Requests `xdg_toplevel.close` for a window.
     pub fn close_window(&self, id: WindowId) -> Result<Reply<()>> {
         self.request(|reply| Command::CloseWindow { id, reply })
+    }
+
+    /// Installs a compositor-provided selection.
+    ///
+    /// Clients holding keyboard/selection focus are offered `mime` and receive
+    /// `data` when they request it. Replaces the current `kind` selection and
+    /// emits [`CompositorEvent::ClipboardUpdated`].
+    pub fn set_selection(
+        &self,
+        kind: SelectionKind,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Reply<()>> {
+        self.request(|reply| Command::SetSelection {
+            kind,
+            mime,
+            data,
+            reply,
+        })
+    }
+
+    /// Clears the current `kind` selection.
+    ///
+    /// Clients are notified their offer is gone and a
+    /// [`CompositorEvent::ClipboardUpdated`] with empty `mime_types` is emitted.
+    pub fn clear_selection(&self, kind: SelectionKind) -> Result<Reply<()>> {
+        self.request(|reply| Command::ClearSelection { kind, reply })
+    }
+
+    /// Reads the current `kind` selection negotiated to `mime`.
+    ///
+    /// Returns the exact bytes the owning client (or the compositor's own
+    /// store, for selections installed via [`Self::set_selection`]) supplies.
+    /// Fails with [`Error::EmptySelection`] when nothing is set and
+    /// [`Error::MimeTypeNotOffered`] when `mime` is not among the offered
+    /// types — neither hangs the compositor event loop.
+    pub fn read_selection(&self, kind: SelectionKind, mime: String) -> Result<Reply<Vec<u8>>> {
+        self.request(|reply| Command::ReadSelection { kind, mime, reply })
+    }
+
+    /// The MIME types the current `kind` selection offers; empty when unset.
+    pub fn selection_mime_types(&self, kind: SelectionKind) -> Result<Reply<Vec<String>>> {
+        self.request(|reply| Command::SelectionMimeTypes { kind, reply })
     }
 
     /// Shuts the compositor down: the event loop stops, all clients are
