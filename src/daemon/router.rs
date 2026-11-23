@@ -52,6 +52,7 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::output::ADD,
     crate::daemon::methods::output::LIST,
     crate::daemon::methods::output::REMOVE,
+    crate::daemon::methods::spawn::SPAWN_APP,
 ];
 
 /// Dispatches one request to its verb and wraps the payload in the standard

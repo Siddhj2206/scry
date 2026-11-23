@@ -650,6 +650,7 @@ name = "scry"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "serde",
  "serde_json",
  "signal-hook",
