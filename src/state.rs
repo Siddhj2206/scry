@@ -6,17 +6,25 @@
 //! [`CompositorEvent`]s over subscription channels.
 
 use std::{
+    collections::HashMap,
     os::unix::net::UnixStream,
     sync::{Arc, Mutex, OnceLock, mpsc::Sender as ReplySender},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use smithay::{
     backend::renderer::utils::{
         CommitCounter, on_commit_buffer_handler, with_renderer_surface_state,
     },
-    desktop::{PopupKind, PopupManager, Space, Window},
-    input::{Seat, SeatHandler, SeatState, keyboard::XkbConfig},
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Space,
+        Window, find_popup_root_surface,
+    },
+    input::{
+        Seat, SeatHandler, SeatState,
+        keyboard::{KeyboardHandle, Keycode, Keysym, XkbConfig},
+        pointer::{Focus, PointerHandle},
+    },
     output::Output,
     reexports::{
         calloop::{
@@ -25,7 +33,10 @@ use smithay::{
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::{
+            wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+            xdg::shell::server::xdg_toplevel,
+        },
         wayland_server::{
             Client, Display, DisplayHandle, ListeningSocket, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
@@ -34,7 +45,7 @@ use smithay::{
             },
         },
     },
-    utils::{SERIAL_COUNTER, Serial, Size},
+    utils::{Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -55,7 +66,11 @@ use smithay::{
             decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
+        text_input::TextInputManagerState,
         viewporter::ViewporterState,
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 use tracing::{debug, error, info, warn};
@@ -66,6 +81,7 @@ use crate::{
     event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
     frame_clock::{FRAME_INTERVAL, FrameClock},
     handle::{Command, Reply},
+    input::TextInputTracker,
     output::{DEFAULT_OUTPUT, OutputSpec, VirtualOutputs, apply_scale_hints},
     render,
 };
@@ -97,9 +113,9 @@ impl ClientData for ClientState {
 }
 
 /// A mapped toplevel plus the metadata snapshot last reported for it.
-struct WindowRecord {
-    id: WindowId,
-    window: Window,
+pub(crate) struct WindowRecord {
+    pub id: WindowId,
+    pub window: Window,
     last_info: WindowInfo,
 }
 
@@ -120,6 +136,10 @@ pub(crate) struct ScryState {
     seat_state: SeatState<ScryState>,
     pub(crate) data_device_state: DataDeviceState,
     pub(crate) primary_selection_state: PrimarySelectionState,
+    /// Retained so the `zwp_text_input_manager_v3` global stays advertised.
+    #[allow(dead_code)]
+    text_input_manager_state: TextInputManagerState,
+    xdg_activation_state: XdgActivationState,
     #[allow(dead_code)] // retained so the xdg_output_manager global lives
     output_manager_state: OutputManagerState,
     #[allow(dead_code)] // retained so the wp_viewporter global lives
@@ -129,21 +149,39 @@ pub(crate) struct ScryState {
     #[allow(dead_code)] // retained so the zxdg_decoration_manager global lives
     xdg_decoration_state: XdgDecorationState,
 
+    // -- input ----------------------------------------------------------------
+    /// The single virtual seat every instance runs. Keyboard focus tracks the
+    /// active toplevel and drives `wl_data_device` / primary selection focus.
+    pub(crate) seat: Seat<ScryState>,
+    /// The seat's keyboard (XKB keymap + state + wl_keyboard forwarding).
+    pub(crate) keyboard: KeyboardHandle<ScryState>,
+    /// The seat's pointer (wl_pointer forwarding + grabs).
+    pub(crate) pointer: PointerHandle<ScryState>,
+    /// The currently keyboard-focused window, if any.
+    pub(crate) focused: Option<WindowId>,
+    /// Times each keycode is logically held (explicit + implicit presses).
+    pub(crate) key_holds: HashMap<Keycode, u32>,
+    /// Modifier keycodes pressed implicitly for a held level>0 keysym.
+    pub(crate) implicit_mods: HashMap<Keycode, Vec<Keycode>>,
+    /// keysym → resolved (keycode, implicit modifiers) cache.
+    pub(crate) keymap_cache: HashMap<Keysym, Option<crate::input::keymap::ResolvedKey>>,
+    /// zwp_text_input_v3 instance enable/commit-serial tracking.
+    pub(crate) text_input_tracker: TextInputTracker,
+    /// Monotonic base for wayland event timestamps.
+    pub(crate) clock: Instant,
+
     // -- desktop model ------------------------------------------------------
-    space: Space<Window>,
-    popup_manager: PopupManager,
+    pub(crate) space: Space<Window>,
+    pub(crate) popup_manager: PopupManager,
     /// The registered virtual outputs (`Virtual-1` and any added via
     /// `update_output`).
     outputs: VirtualOutputs,
 
     // -- bookkeeping ---------------------------------------------------------
-    /// The single seat: keyboard focus tracks the active toplevel and drives
-    /// `wl_data_device` / primary selection focus.
-    pub(crate) seat: Seat<ScryState>,
     /// Toplevels that were created but have not committed a buffer yet.
     pending_toplevels: Vec<ToplevelSurface>,
     /// Currently mapped toplevel windows.
-    windows: Vec<WindowRecord>,
+    pub(crate) windows: Vec<WindowRecord>,
     /// Currently mapped popups (any window's).
     mapped_popups: Vec<PopupRecord>,
     /// Monotonic event/ack sequence counter.
@@ -192,8 +230,22 @@ impl ScryState {
         // only honors `set_selection` from the client holding keyboard focus.
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(dh, "seat0");
-        seat.add_keyboard(XkbConfig::default(), 200, 25)
-            .expect("failed to initialize the seat keyboard");
+        // An explicit keymap keeps input deterministic regardless of
+        // XKB_DEFAULT_* environment variables on the host.
+        let keyboard = seat
+            .add_keyboard(
+                XkbConfig {
+                    rules: "evdev",
+                    model: "pc105",
+                    layout: "us",
+                    variant: "",
+                    options: None,
+                },
+                200,
+                25,
+            )
+            .expect("failed to load default xkb keymap");
+        let pointer = seat.add_pointer();
 
         Self {
             compositor_state: CompositorState::new_v6::<Self>(dh),
@@ -202,14 +254,24 @@ impl ScryState {
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
             primary_selection_state: PrimarySelectionState::new::<Self>(dh),
+            text_input_manager_state: TextInputManagerState::new::<Self>(dh),
+            xdg_activation_state: XdgActivationState::new::<Self>(dh),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             viewporter_state: ViewporterState::new::<Self>(dh),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
             xdg_decoration_state: XdgDecorationState::new::<Self>(dh),
+            seat,
+            keyboard,
+            pointer,
+            focused: None,
+            key_holds: HashMap::new(),
+            implicit_mods: HashMap::new(),
+            keymap_cache: HashMap::new(),
+            text_input_tracker: TextInputTracker::default(),
+            clock: Instant::now(),
             space,
             popup_manager: PopupManager::default(),
             outputs,
-            seat,
             pending_toplevels: Vec::new(),
             windows: Vec::new(),
             mapped_popups: Vec::new(),
@@ -302,11 +364,25 @@ impl ScryState {
     }
 
     /// Resolves the mapped window owning `surface`, following subsurface
-    /// parents up to their root surface.
-    fn window_id_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
+    /// and popup parents up to their root surface.
+    pub(crate) fn window_id_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
         let mut root = surface.clone();
-        while let Some(parent) = get_parent(&root) {
-            root = parent;
+        loop {
+            if let Some(parent) = get_parent(&root) {
+                root = parent;
+                continue;
+            }
+            if get_role(&root) == Some(XDG_POPUP_ROLE) {
+                let Some(popup) = self.popup_manager.find_popup(&root) else {
+                    break;
+                };
+                let Ok(parent) = find_popup_root_surface(&popup) else {
+                    break;
+                };
+                root = parent;
+                continue;
+            }
+            break;
         }
         self.windows
             .iter()
@@ -415,7 +491,9 @@ impl ScryState {
                     seq,
                     window_id: record.id,
                 });
-                self.refocus_topmost();
+                if self.focused == Some(record.id) {
+                    self.focus_fallback();
+                }
                 return;
             }
             let info = self.window_info(self.windows[pos].id, &self.windows[pos].window);
@@ -439,7 +517,6 @@ impl ScryState {
             return;
         };
         let toplevel = self.pending_toplevels.remove(pos);
-        let wl_surface = toplevel.wl_surface().clone();
         let window = Window::new_wayland_window(toplevel);
         self.space.map_element(window.clone(), (0, 0), true);
         window.on_commit();
@@ -449,13 +526,13 @@ impl ScryState {
         let info = self.window_info(id, &window);
         self.windows.push(WindowRecord {
             id,
-            window,
+            window: window.clone(),
             last_info: info.clone(),
         });
         self.emit(|seq| CompositorEvent::WindowMapped { seq, window: info });
-        // The newly mapped (activated) toplevel takes keyboard focus, which
-        // `focus_changed` mirrors into the seat's selection focus.
-        self.focus_surface(Some(wl_surface));
+        // Newly mapped toplevels take focus (raise + activate + keyboard),
+        // and `focus_changed` mirrors the client into the seat's selections.
+        self.focus_window(&window);
     }
 
     /// Maps / unmaps an `xdg_popup` following a commit.
@@ -552,28 +629,10 @@ impl ScryState {
                 seq,
                 window_id: record.id,
             });
-            self.refocus_topmost();
+            if self.focused == Some(record.id) {
+                self.focus_fallback();
+            }
         }
-    }
-
-    /// Moves keyboard focus to `surface`; [`SeatHandler::focus_changed`]
-    /// mirrors the owning client into the seat's selection focus.
-    fn focus_surface(&mut self, surface: Option<WlSurface>) {
-        let serial = SERIAL_COUNTER.next_serial();
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, surface, serial);
-        }
-    }
-
-    /// After a window leaves, focus falls back deterministically to the
-    /// topmost remaining mapped toplevel (or to nothing).
-    fn refocus_topmost(&mut self) {
-        let topmost = self
-            .space
-            .elements()
-            .last()
-            .and_then(|window| window.wl_surface().map(|s| s.into_owned()));
-        self.focus_surface(topmost);
     }
 
     /// A surface owned by a toplevel role disappeared (defensive cleanup for
@@ -590,6 +649,79 @@ impl ScryState {
     /// Executes one [`Command`] coming from a [`crate::CompositorHandle`].
     fn handle_command(&mut self, command: Command) {
         match command {
+            Command::PointerMotion {
+                target,
+                x,
+                y,
+                reply,
+            } => {
+                let outcome = self.cmd_pointer_motion(target, x, y);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::PointerButton {
+                button,
+                pressed,
+                reply,
+            } => {
+                let outcome = self.cmd_pointer_button(button, pressed);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::PointerScroll { x, y, reply } => {
+                let outcome = self.cmd_pointer_scroll(x, y);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::KeyEvent {
+                name,
+                pressed,
+                reply,
+            } => {
+                let outcome = self.cmd_key_event(&name, pressed);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::KeyCombo {
+                name,
+                modifiers,
+                reply,
+            } => {
+                let outcome = self.cmd_key_combo(&name, &modifiers);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::TypeText { text, reply } => {
+                let outcome = self.cmd_type_text(&text);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::FocusWindow { id, reply } => {
+                let outcome = self.cmd_focus_window(id);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
             Command::Shutdown { reply } => {
                 let _ = reply.send(Ok(Reply {
                     seq: self.seq,
@@ -922,10 +1054,39 @@ impl XdgShellHandler for ScryState {
         }
     }
 
-    fn grab(&mut self, surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // No seat is advertised yet; popup grabs arrive with the input
-        // sub-issue. Dismiss politely instead of leaving the popup stuck.
-        surface.send_popup_done();
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            warn!("popup grab for unknown seat");
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            warn!("popup grab without a live parent");
+            return;
+        };
+        let Ok(mut grab) = self.popup_manager.grab_popup(root, kind, &seat, serial) else {
+            return;
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 
     fn reposition_request(
@@ -1008,11 +1169,44 @@ impl SeatHandler for ScryState {
     }
 
     /// Selection focus follows keyboard focus: the client owning the focused
-    /// surface is offered both the clipboard and the primary selection.
+    /// surface is offered both the clipboard and the primary selection. The
+    /// owning [`WindowId`] is tracked in `self.focused` and reported via
+    /// [`CompositorEvent::WindowFocused`].
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let client = focused.and_then(|surface| surface.client());
         set_data_device_focus(&self.display_handle, seat, client.clone());
         set_primary_focus(&self.display_handle, seat, client);
+        let id = focused.and_then(|surface| self.window_id_for_surface(surface));
+        if self.focused != id {
+            self.focused = id;
+            self.emit(|seq| CompositorEvent::WindowFocused { seq, window_id: id });
+        }
+    }
+}
+
+impl XdgActivationHandler for ScryState {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        _token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        if let Some(id) = self.window_id_for_surface(&surface) {
+            if let Err(err) = self.focus_window_id(id) {
+                debug!("activation for unmapped window: {err}");
+            }
+        } else {
+            debug!("activation request for an unknown surface");
+        }
+        self.xdg_activation_state.remove_token(&token);
     }
 }
 
@@ -1022,8 +1216,20 @@ smithay::delegate_xdg_shell!(ScryState);
 smithay::delegate_xdg_decoration!(ScryState);
 smithay::delegate_output!(ScryState);
 smithay::delegate_seat!(ScryState);
+smithay::delegate_xdg_activation!(ScryState);
 smithay::delegate_viewporter!(ScryState);
 smithay::delegate_fractional_scale!(ScryState);
+
+// zwp_text_input_v3: the manager global + its dispatch are delegated to
+// smithay's state, while ZwpTextInputV3 requests are dispatched to ScryState's
+// own impl (src/input/text_input.rs), which additionally tracks enable state
+// and commit serials for IME-less text injection.
+smithay::reexports::wayland_server::delegate_global_dispatch!(ScryState: [
+    ZwpTextInputManagerV3: ()
+] => TextInputManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(ScryState: [
+    ZwpTextInputManagerV3: ()
+] => TextInputManagerState);
 
 /// Applies `scale` hints to every surface in `root`'s subsurface tree.
 fn set_surface_tree_hints(root: &WlSurface, scale: f64) {

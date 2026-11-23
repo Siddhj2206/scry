@@ -110,6 +110,20 @@ pub enum CompositorEvent {
         /// Identifier of the window that closed.
         window_id: WindowId,
     },
+    /// Keyboard focus moved to a different window (or was cleared).
+    ///
+    /// Focus moves when a window maps, on click-to-focus, through
+    /// `xdg_activation_v1` activation or [`CompositorHandle::focus_window`],
+    /// and falls back to the topmost remaining toplevel when the focused
+    /// window closes.
+    ///
+    /// [`CompositorHandle::focus_window`]: crate::CompositorHandle::focus_window
+    WindowFocused {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// The newly focused window, or `None` when focus was cleared.
+        window_id: Option<WindowId>,
+    },
     /// An `xdg_popup` mapped: its first buffer commit became visible.
     PopupMapped {
         /// Sequence number of this event.
@@ -166,6 +180,7 @@ impl CompositorEvent {
             Self::WindowMapped { seq, .. }
             | Self::WindowUpdated { seq, .. }
             | Self::WindowClosed { seq, .. }
+            | Self::WindowFocused { seq, .. }
             | Self::PopupMapped { seq, .. }
             | Self::PopupClosed { seq, .. }
             | Self::SurfaceCommitted { seq, .. }

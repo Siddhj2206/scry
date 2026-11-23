@@ -19,6 +19,7 @@ use crate::{
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
     frame::Frame,
     frame_clock::FrameClockMode,
+    input::{PointerButton, PointerTarget},
     output::{OutputInfo, OutputSpec},
 };
 
@@ -80,6 +81,53 @@ pub(crate) enum Command {
     },
     /// Ask a toplevel to close (`xdg_toplevel.close`).
     CloseWindow {
+        id: WindowId,
+        reply: Sender<Outcome<()>>,
+    },
+
+    // -- input ---------------------------------------------------------------
+    /// Move the pointer to a position in the target's coordinate space,
+    /// sending enter/motion/leave as needed.
+    PointerMotion {
+        target: PointerTarget,
+        x: f64,
+        y: f64,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Press or release an evdev pointer button at the current location.
+    PointerButton {
+        /// evdev button code (e.g. `BTN_LEFT` = 0x110).
+        button: u32,
+        pressed: bool,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Emit one scroll axis frame (wheel source) at the current location.
+    PointerScroll {
+        /// Horizontal delta; negative scrolls left. 15.0 = one detent.
+        x: f64,
+        /// Vertical delta; negative scrolls up. 15.0 = one detent.
+        y: f64,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Press or release a physical key by name.
+    KeyEvent {
+        name: String,
+        pressed: bool,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Hold `modifiers`, tap `name`, release the modifiers.
+    KeyCombo {
+        name: String,
+        modifiers: Vec<String>,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Inject text, preferring `zwp_text_input_v3` with an XKB fallback.
+    TypeText {
+        text: String,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Raise and keyboard-focus a window.
+    FocusWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
     },
@@ -223,6 +271,113 @@ impl CompositorHandle {
         self.request(|reply| Command::CloseWindow { id, reply })
     }
 
+    // -- synthetic input -----------------------------------------------------
+
+    /// Moves the virtual pointer, delivering `wl_pointer` enter/motion/leave
+    /// to whatever surface ends up underneath.
+    ///
+    /// - [`PointerTarget::Output`]: global logical output coordinates; the
+    ///   topmost surface under the point is entered.
+    /// - [`PointerTarget::Window`]: coordinates relative to that window's
+    ///   logical top-left corner — the named window is targeted even when
+    ///   covered by others; points outside it fail with
+    ///   [`Error::OutsideWindow`].
+    pub fn move_pointer(&self, target: PointerTarget, x: f64, y: f64) -> Result<Reply<()>> {
+        self.request(|reply| Command::PointerMotion {
+            target,
+            x,
+            y,
+            reply,
+        })
+    }
+
+    /// Presses an evdev [`PointerButton`] (e.g. `PointerButton::Left`) at the
+    /// pointer's current location. Pressing on an unfocused toplevel raises
+    /// and focuses it (click-to-focus).
+    pub fn press_pointer_button(&self, button: PointerButton) -> Result<Reply<()>> {
+        let button = button.code()?;
+        self.request(|reply| Command::PointerButton {
+            button,
+            pressed: true,
+            reply,
+        })
+    }
+
+    /// Releases a previously pressed [`PointerButton`].
+    pub fn release_pointer_button(&self, button: PointerButton) -> Result<Reply<()>> {
+        let button = button.code()?;
+        self.request(|reply| Command::PointerButton {
+            button,
+            pressed: false,
+            reply,
+        })
+    }
+
+    /// Emits a complete pointer scroll frame at the current location: both
+    /// axis deltas (15.0 = one wheel detent, negatives scroll up/left) plus
+    /// `wl_pointer.axis_v120` for clients that want discrete steps).
+    pub fn scroll_pointer(&self, x: f64, y: f64) -> Result<Reply<()>> {
+        self.request(|reply| Command::PointerScroll { x, y, reply })
+    }
+
+    /// Presses the physical key named `key`.
+    ///
+    /// Names are XKB keysym names resolved case-insensitively (`a`, `F5`,
+    /// `Return`, `space`, `Left`, …) plus convenience aliases (`ctrl`, `alt`,
+    /// `super`, `enter`, `esc`, `pgup`, …). Keysyms living on shifted keymap
+    /// levels hold Shift (or AltGr) implicitly until the matching release.
+    /// Unknown names fail with [`Error::UnknownKey`].
+    pub fn press_key(&self, key: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::KeyEvent {
+            name: key.to_string(),
+            pressed: true,
+            reply,
+        })
+    }
+
+    /// Releases the physical key named `key` (see [`Self::press_key`]).
+    pub fn release_key(&self, key: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::KeyEvent {
+            name: key.to_string(),
+            pressed: false,
+            reply,
+        })
+    }
+
+    /// Taps `key` while holding `modifiers` — e.g. `key("c", &["ctrl"])`
+    /// sends a Ctrl+C. Modifier names: `ctrl`, `shift`, `alt`, `super`
+    /// (aliases `logo`/`meta`/`win`/`cmd`), `altgr`, `capslock`, `numlock`.
+    /// Unrecognised modifier names fail with [`Error::UnknownModifier`].
+    pub fn key(&self, key: &str, modifiers: &[&str]) -> Result<Reply<()>> {
+        self.request(|reply| Command::KeyCombo {
+            name: key.to_string(),
+            modifiers: modifiers.iter().map(|m| m.to_string()).collect(),
+            reply,
+        })
+    }
+
+    /// Injects text into the focused window.
+    ///
+    /// When the focused client owns an enabled `zwp_text_input_v3` instance
+    /// the whole string is committed through it (arbitrary UTF-8, including
+    /// accents and emoji). Otherwise each character is typed as physical XKB
+    /// key events; characters no keymap keysym produces fail with
+    /// [`Error::UnmappableCharacter`] rather than being dropped silently.
+    /// Fails with [`Error::NoFocusedSurface`] when nothing is focused.
+    pub fn type_text(&self, text: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::TypeText {
+            text: text.to_string(),
+            reply,
+        })
+    }
+
+    /// Raises `id` to the top of the stacking order and moves keyboard and
+    /// `zwp_text_input_v3` focus to it, toggling `Activated` on the affected
+    /// toplevels.
+    pub fn focus_window(&self, id: WindowId) -> Result<Reply<()>> {
+        self.request(|reply| Command::FocusWindow { id, reply })
+    }
+
     /// Captures a window's complete surface tree into an RGBA frame.
     ///
     /// The capture is occlusion-free: the window is composited on its own,
@@ -288,6 +443,18 @@ impl CompositorHandle {
         })
     }
 
+    /// [`capture_output`](Self::capture_output) encoded as PNG.
+    pub fn capture_output_png(&self, name: &str) -> Result<Reply<Vec<u8>>> {
+        self.capture_output(name)?
+            .try_map(|frame| frame.encode_png())
+    }
+
+    /// [`capture_output`](Self::capture_output) encoded as lossless WebP.
+    pub fn capture_output_webp(&self, name: &str) -> Result<Reply<Vec<u8>>> {
+        self.capture_output(name)?
+            .try_map(|frame| frame.encode_webp())
+    }
+
     /// Switches the virtual frame clock between [`FrameClockMode::Realtime`]
     /// (60Hz cadence, the default) and [`FrameClockMode::Paused`] (callbacks
     /// held until [`Self::step_frame_clock`] advances the clock).
@@ -327,18 +494,6 @@ impl CompositorHandle {
             data,
             reply,
         })
-    }
-
-    /// [`capture_output`](Self::capture_output) encoded as PNG.
-    pub fn capture_output_png(&self, name: &str) -> Result<Reply<Vec<u8>>> {
-        self.capture_output(name)?
-            .try_map(|frame| frame.encode_png())
-    }
-
-    /// [`capture_output`](Self::capture_output) encoded as lossless WebP.
-    pub fn capture_output_webp(&self, name: &str) -> Result<Reply<Vec<u8>>> {
-        self.capture_output(name)?
-            .try_map(|frame| frame.encode_webp())
     }
 
     /// Clears the current `kind` selection.

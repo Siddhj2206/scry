@@ -54,6 +54,8 @@ mod event;
 mod frame;
 mod frame_clock;
 mod handle;
+/// Synthetic input types (`wl_seat` pointer/keyboard/text injection).
+pub mod input;
 mod output;
 mod render;
 mod state;

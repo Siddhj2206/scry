@@ -200,8 +200,6 @@ impl SelectionClient {
 
 // -- protocol dispatch for selection plumbing --------------------------------
 
-wayland_client::delegate_noop!(ClientState: ignore wl_seat::WlSeat);
-wayland_client::delegate_noop!(ClientState: ignore wayland_client::protocol::wl_keyboard::WlKeyboard);
 wayland_client::delegate_noop!(ClientState: ignore wl_data_device_manager::WlDataDeviceManager);
 
 impl Dispatch<wl_data_device::WlDataDevice, ()> for ClientState {

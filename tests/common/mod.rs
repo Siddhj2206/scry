@@ -15,17 +15,19 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_data_offer, wl_output, wl_registry, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_offer, wl_keyboard, wl_output, wl_pointer,
+        wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols::{
     wp::{
         fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
         primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+        text_input::zv3::client::{zwp_text_input_manager_v3, zwp_text_input_v3},
         viewporter::client::{wp_viewport, wp_viewporter},
     },
     xdg::{
+        activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1},
         decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
         shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
         xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1},
@@ -133,6 +135,71 @@ pub struct ClientState {
     pub clipboard: ClipboardChannel,
     /// `zwp_primary_selection_v1` plumbing.
     pub primary: PrimaryChannel,
+
+    // -- input ------------------------------------------------------------
+    pub seat_caps: u32,
+    pub pointer: Option<wl_pointer::WlPointer>,
+    pub keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// (surface, surface-local x, y)
+    pub pointer_enters: Vec<(wl_surface::WlSurface, f64, f64)>,
+    pub pointer_leaves: Vec<wl_surface::WlSurface>,
+    /// (surface-local x, y)
+    pub pointer_motions: Vec<(f64, f64)>,
+    /// (button, state: 1 pressed / 0 released)
+    pub pointer_buttons: Vec<(u32, u32)>,
+    /// The last serial delivered with a pointer button event.
+    pub last_button_serial: u32,
+    /// (axis: 0 vertical / 1 horizontal, value)
+    pub pointer_axis: Vec<(u32, f64)>,
+    /// Raw keymap payload from `wl_keyboard.keymap` (XKB v1 text format).
+    pub keymap: Option<Vec<u8>>,
+    /// (surface, serial)
+    pub kb_enters: Vec<(wl_surface::WlSurface, u32)>,
+    pub kb_leaves: Vec<wl_surface::WlSurface>,
+    /// (evdev keycode, state: 1 pressed / 0 released)
+    pub keys: Vec<(u32, u32)>,
+    /// Latest (depressed, latched, locked, group) from `wl_keyboard.modifiers`.
+    pub mods: (u32, u32, u32, u32),
+    /// Every modifiers event seen so far, in order.
+    pub mods_log: Vec<(u32, u32, u32, u32)>,
+    /// zwp_text_input_v3 events
+    pub ti_enters: usize,
+    pub ti_leaves: usize,
+    pub ti_strings: Vec<String>,
+    pub ti_dones: Vec<u32>,
+    /// xdg_activation token produced by `xdg_activation_token_v1.done`.
+    pub activation_token: Option<String>,
+}
+
+impl ClientState {
+    /// Decodes every delivered key press through the advertised keymap and
+    /// returns the UTF-8 text a real client would have typed.
+    pub fn typed_text(&self) -> String {
+        use smithay::input::keyboard::xkb;
+        let data = self.keymap.as_ref().expect("client got no keymap");
+        // The keymap payload is NUL-terminated; strip it for String::new.
+        let end = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_string(
+            &context,
+            String::from_utf8_lossy(&data[..end]).into_owned(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("keymap failed to compile");
+        let mut state = xkb::State::new(&keymap);
+        let mut out = String::new();
+        for &(key, pressed) in &self.keys {
+            let code = xkb::Keycode::new(key + 8);
+            if pressed == 1 {
+                state.update_key(code, xkb::KeyDirection::Down);
+                out.push_str(&state.key_get_utf8(code));
+            } else {
+                state.update_key(code, xkb::KeyDirection::Up);
+            }
+        }
+        out
+    }
 }
 
 /// A connected test client with the core globals bound.
@@ -146,6 +213,9 @@ pub struct TestClient {
     pub subcompositor: Option<wayland_client::protocol::wl_subcompositor::WlSubcompositor>,
     pub wm_base: xdg_wm_base::XdgWmBase,
     pub output: Option<wl_output::WlOutput>,
+    pub seat: Option<wl_seat::WlSeat>,
+    pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    pub activation: Option<xdg_activation_v1::XdgActivationV1>,
 }
 
 impl TestClient {
@@ -173,6 +243,13 @@ impl TestClient {
                 (),
             )
             .ok();
+        let seat = globals.bind::<wl_seat::WlSeat, _, _>(&qh, 1..=9, ()).ok();
+        let text_input_manager = globals
+            .bind::<zwp_text_input_manager_v3::ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ())
+            .ok();
+        let activation = globals
+            .bind::<xdg_activation_v1::XdgActivationV1, _, _>(&qh, 1..=1, ())
+            .ok();
 
         let mut client = Self {
             state: ClientState::default(),
@@ -184,6 +261,9 @@ impl TestClient {
             subcompositor,
             wm_base,
             output: None,
+            seat,
+            text_input_manager,
+            activation,
         };
         if client
             .globals
@@ -238,12 +318,14 @@ impl TestClient {
     }
 
     /// Dispatches events until `pred` holds or the timeout elapses.
+    ///
+    /// Each iteration is a server roundtrip (`wl_display.sync`), so the loop
+    /// can never block indefinitely on a quiet socket — only a genuinely
+    /// deadlocked compositor could stall it.
     pub fn pump_until(&mut self, pred: impl Fn(&ClientState) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         while !pred(&self.state) {
-            self.eq
-                .blocking_dispatch(&mut self.state)
-                .expect("dispatch failed");
+            self.roundtrip();
             assert!(Instant::now() < deadline, "timed out pumping client events");
         }
     }
@@ -309,6 +391,35 @@ impl TestClient {
             toplevel,
             buffer,
         }
+    }
+
+    /// Creates an enabled `zwp_text_input_v3` instance on the compositor's
+    /// seat. Requires the manager global; panics if it is missing.
+    pub fn new_text_input(&self) -> zwp_text_input_v3::ZwpTextInputV3 {
+        let seat = self.seat.as_ref().expect("wl_seat not advertised");
+        let manager = self
+            .text_input_manager
+            .as_ref()
+            .expect("zwp_text_input_manager_v3 not advertised");
+        let text_input = manager.get_text_input(seat, &self.qh, ());
+        text_input.enable();
+        text_input.commit();
+        text_input
+    }
+
+    /// Runs an `xdg_activation_v1` activation request for `surface`:
+    /// creates a token, commits it, then activates the surface with it.
+    pub fn activate(&mut self, surface: &wl_surface::WlSurface) {
+        let activation = self
+            .activation
+            .clone()
+            .expect("xdg_activation_v1 not advertised");
+        let token = activation.get_activation_token(&self.qh, ());
+        token.commit();
+        self.pump_until(|s| s.activation_token.is_some());
+        let token_string = self.state.activation_token.take().unwrap();
+        activation.activate(token_string, surface);
+        self.roundtrip();
     }
 }
 
@@ -557,6 +668,198 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientState {
             }
             xdg_toplevel::Event::Close => state.close_requested = true,
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_seat::Event::Capabilities {
+                capabilities: WEnum::Value(capability),
+            } => {
+                state.seat_caps = capability.bits();
+                if capability.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+                    state.pointer = Some(proxy.get_pointer(qh, ()));
+                }
+                if capability.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+                    state.keyboard = Some(proxy.get_keyboard(qh, ()));
+                }
+            }
+            wl_seat::Event::Name { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter {
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => state.pointer_enters.push((surface, surface_x, surface_y)),
+            wl_pointer::Event::Leave { surface, .. } => state.pointer_leaves.push(surface),
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.pointer_motions.push((surface_x, surface_y)),
+            wl_pointer::Event::Button {
+                serial,
+                button,
+                state: WEnum::Value(button_state),
+                ..
+            } => {
+                state.last_button_serial = serial;
+                state.pointer_buttons.push((
+                    button,
+                    u32::from(button_state == wl_pointer::ButtonState::Pressed),
+                ));
+            }
+            wl_pointer::Event::Axis {
+                axis: WEnum::Value(axis),
+                value,
+                ..
+            } => {
+                let axis = match axis {
+                    wl_pointer::Axis::VerticalScroll => 0,
+                    wl_pointer::Axis::HorizontalScroll => 1,
+                    _ => 2,
+                };
+                state.pointer_axis.push((axis, value));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                assert_eq!(
+                    format,
+                    WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                    "unexpected keymap format"
+                );
+                let file = std::fs::File::from(fd);
+                let mut data = vec![0u8; size as usize];
+                // The fd is a dup of the keymap file shared across seats and
+                // clients; read at offset 0 without touching its shared
+                // position (a second client would otherwise hit EOF).
+                std::os::unix::fs::FileExt::read_exact_at(&file, &mut data, 0)
+                    .expect("keymap read failed");
+                state.keymap = Some(data);
+            }
+            wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => state.kb_enters.push((surface, serial)),
+            wl_keyboard::Event::Leave { surface, .. } => state.kb_leaves.push(surface),
+            wl_keyboard::Event::Key {
+                key,
+                state: WEnum::Value(key_state),
+                ..
+            } => state
+                .keys
+                .push((key, u32::from(key_state == wl_keyboard::KeyState::Pressed))),
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                state.mods = (mods_depressed, mods_latched, mods_locked, group);
+                state
+                    .mods_log
+                    .push((mods_depressed, mods_latched, mods_locked, group));
+            }
+            wl_keyboard::Event::RepeatInfo { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_text_input_manager_v3::ZwpTextInputManagerV3, ()> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+        _event: zwp_text_input_manager_v3::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _proxy: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => state.ti_enters += 1,
+            zwp_text_input_v3::Event::Leave { .. } => state.ti_leaves += 1,
+            zwp_text_input_v3::Event::CommitString { text: Some(text) } => {
+                state.ti_strings.push(text)
+            }
+            zwp_text_input_v3::Event::Done { serial } => state.ti_dones.push(serial),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &xdg_activation_v1::XdgActivationV1,
+        _event: xdg_activation_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _proxy: &xdg_activation_token_v1::XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let xdg_activation_token_v1::Event::Done { token } = event {
+            state.activation_token = Some(token);
         }
     }
 }
