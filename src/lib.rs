@@ -10,11 +10,14 @@
 //! │   · windows()        │─────────▶│  · wl_compositor/subcompositor│
 //! │   · resize/close     │          │  · wl_shm                     │
 //! │   · set/read         │          │  · xdg_shell (toplevel/popup) │
-//! │     selection        │          │  · wl_output (virtual)        │
-//! │   · shutdown()       │          │  · wl_seat + clipboard        │
-//! │                      │          │    (wl_data_device + primary) │
-//! │   subscribe()        │  events  │  · Space + PopupManager       │
-//! │   ◀───────────────── │◀─────────│  · SO_PEERCRED pid registry   │
+//! │     selection        │          │    + xdg_decoration           │
+//! │   · update_output    │          │  · wl_output (virtual) +      │
+//! │   · shutdown()       │          │    wp_viewporter +            │
+//! │                      │          │    wp_fractional_scale_v1     │
+//! │   subscribe()        │  events  │  · wl_seat + clipboard        │
+//! │   ◀───────────────── │◀─────────│    (wl_data_device + primary) │
+//! │                      │          │  · Space + PopupManager       │
+//! │                      │          │  · SO_PEERCRED pid registry   │
 //! └──────────────────────┘          └────────────▲─────────────────┘
 //!                                                │ real Unix socket
 //!                                          wayland clients
@@ -51,6 +54,7 @@ mod event;
 mod frame;
 mod frame_clock;
 mod handle;
+mod output;
 mod render;
 mod state;
 
@@ -61,3 +65,4 @@ pub use event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, Wind
 pub use frame::Frame;
 pub use frame_clock::FrameClockMode;
 pub use handle::{CompositorHandle, Reply};
+pub use output::{OutputInfo, OutputSpec};

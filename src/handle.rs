@@ -19,6 +19,7 @@ use crate::{
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
     frame::Frame,
     frame_clock::FrameClockMode,
+    output::{OutputInfo, OutputSpec},
 };
 
 /// How long a command waits for the compositor's reply before giving up.
@@ -92,6 +93,20 @@ pub(crate) enum Command {
     CaptureOutput {
         name: String,
         reply: Sender<Outcome<Frame>>,
+    },
+    /// Snapshot all registered virtual outputs.
+    Outputs {
+        reply: Sender<Outcome<Vec<OutputInfo>>>,
+    },
+    /// Add or reconfigure a virtual output.
+    UpdateOutput {
+        spec: OutputSpec,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Remove a virtual output by `wl_output` name.
+    RemoveOutput {
+        name: String,
+        reply: Sender<Outcome<()>>,
     },
     /// Switch the virtual frame clock between realtime and paused modes.
     SetFrameClockMode {
@@ -228,8 +243,41 @@ impl CompositorHandle {
             .try_map(|frame| frame.encode_webp())
     }
 
+    /// Lists all registered virtual outputs with their advertised mode,
+    /// scale and logical geometry.
+    pub fn outputs(&self) -> Result<Reply<Vec<OutputInfo>>> {
+        self.request(|reply| Command::Outputs { reply })
+    }
+
+    /// Adds a virtual output, or reconfigures the existing one named
+    /// `spec.name`.
+    ///
+    /// New outputs advertise a `wl_output` global (mode, scale and
+    /// `zxdg_output_v1` logical geometry) and are mapped into compositor
+    /// space at `spec.position`. Updates push the changed attributes to
+    /// every bound `wl_output` and re-publish scale hints to surfaces
+    /// overlapping the output. Invalid specs are rejected with
+    /// [`Error::InvalidOutputSpec`].
+    pub fn update_output(&self, spec: OutputSpec) -> Result<Reply<()>> {
+        self.request(|reply| Command::UpdateOutput { spec, reply })
+    }
+
+    /// Removes the virtual output named `name`, withdrawing its
+    /// `wl_output` global (`wl_registry.global_remove`) and unmapping it
+    /// from compositor space.
+    ///
+    /// Unknown names return [`Error::UnknownOutput`]; removing the last
+    /// remaining output is rejected with [`Error::InvalidOutputSpec`].
+    pub fn remove_output(&self, name: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::RemoveOutput {
+            name: name.to_string(),
+            reply,
+        })
+    }
+
     /// Captures a whole virtual output: all visible windows composited in
-    /// z-order over an opaque black background.
+    /// z-order over an opaque black background at the output's physical
+    /// (mode) pixel resolution.
     ///
     /// `name` is the `wl_output` name (the built-in virtual output is
     /// `"Virtual-1"`); unknown names return [`Error::UnknownOutput`].

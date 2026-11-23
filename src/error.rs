@@ -41,6 +41,10 @@ pub enum Error {
     #[error("unknown output: {0}")]
     UnknownOutput(String),
 
+    /// An [`crate::OutputSpec`] failed validation.
+    #[error("invalid output spec: {0}")]
+    InvalidOutputSpec(String),
+
     /// A frame capture could not be produced.
     #[error("capture failed: {0}")]
     Capture(String),

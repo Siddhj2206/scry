@@ -17,7 +17,7 @@ use smithay::{
     },
     desktop::{PopupKind, PopupManager, Space, Window},
     input::{Seat, SeatHandler, SeatState, keyboard::XkbConfig},
-    output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
+    output::Output,
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
@@ -39,8 +39,10 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, get_parent, get_role, with_states,
+            SurfaceAttributes, TraversalAction, get_parent, get_role, with_states,
+            with_surface_tree_downward,
         },
+        fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         output::{OutputHandler, OutputManagerState},
         seat::WaylandFocus,
         selection::{
@@ -50,8 +52,10 @@ use smithay::{
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE,
             XdgPopupSurfaceData, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
+            decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
+        viewporter::ViewporterState,
     },
 };
 use tracing::{debug, error, info, warn};
@@ -62,13 +66,11 @@ use crate::{
     event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
     frame_clock::{FRAME_INTERVAL, FrameClock},
     handle::{Command, Reply},
+    output::{DEFAULT_OUTPUT, OutputSpec, VirtualOutputs, apply_scale_hints},
     render,
 };
 
-/// Size of the single virtual output every `Compositor` starts with.
-const DEFAULT_OUTPUT_SIZE: (i32, i32) = (1920, 1080);
-/// Refresh rate of the default virtual output, in mHz.
-const DEFAULT_OUTPUT_REFRESH: i32 = 60_000;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
 /// Marker stored in every `wl_surface`'s `data_map`, carrying its stable
 /// [`SurfaceId`] and the commit counter up to which its damage was reported.
@@ -105,6 +107,8 @@ struct WindowRecord {
 struct PopupRecord {
     surface_id: SurfaceId,
     surface: WlSurface,
+    /// The toplevel window it anchors to, when mapped under one.
+    window_id: Option<WindowId>,
 }
 
 /// The compositor state owned by the event-loop thread.
@@ -118,13 +122,19 @@ pub(crate) struct ScryState {
     pub(crate) primary_selection_state: PrimarySelectionState,
     #[allow(dead_code)] // retained so the xdg_output_manager global lives
     output_manager_state: OutputManagerState,
+    #[allow(dead_code)] // retained so the wp_viewporter global lives
+    viewporter_state: ViewporterState,
+    #[allow(dead_code)] // state lives inside surface data_maps
+    fractional_scale_state: FractionalScaleManagerState,
+    #[allow(dead_code)] // retained so the zxdg_decoration_manager global lives
+    xdg_decoration_state: XdgDecorationState,
 
     // -- desktop model ------------------------------------------------------
     space: Space<Window>,
     popup_manager: PopupManager,
-    /// The always-present virtual output; also the scanout output reported
-    /// for `wl_surface.frame` callbacks.
-    default_output: Output,
+    /// The registered virtual outputs (`Virtual-1` and any added via
+    /// `update_output`).
+    outputs: VirtualOutputs,
 
     // -- bookkeeping ---------------------------------------------------------
     /// The single seat: keyboard focus tracks the active toplevel and drives
@@ -161,30 +171,22 @@ impl ScryState {
         loop_handle: LoopHandle<'static, ScryState>,
         loop_signal: LoopSignal,
     ) -> Self {
-        let default_output = Output::new(
-            "Virtual-1".to_string(),
-            PhysicalProperties {
-                size: (0, 0).into(),
-                subpixel: Subpixel::Unknown,
-                make: "scry".to_string(),
-                model: "virtual".to_string(),
-            },
-        );
-        let mode = OutputMode {
-            size: DEFAULT_OUTPUT_SIZE.into(),
-            refresh: DEFAULT_OUTPUT_REFRESH,
-        };
-        default_output.change_current_state(
-            Some(mode),
-            None,
-            Some(Scale::Integer(1)),
-            Some((0, 0).into()),
-        );
-        default_output.set_preferred(mode);
-        let _global = default_output.create_global::<Self>(dh);
-
         let mut space = Space::default();
-        space.map_output(&default_output, (0, 0));
+        let mut outputs = VirtualOutputs::new();
+        let (name, size, refresh, scale, position) = DEFAULT_OUTPUT;
+        outputs
+            .update(
+                dh,
+                &mut space,
+                OutputSpec {
+                    name: name.to_string(),
+                    size,
+                    refresh_millihertz: refresh,
+                    scale,
+                    position,
+                },
+            )
+            .expect("default output spec must be valid");
 
         // The seat needs a keyboard for clients to own selections: smithay
         // only honors `set_selection` from the client holding keyboard focus.
@@ -201,9 +203,12 @@ impl ScryState {
             data_device_state: DataDeviceState::new::<Self>(dh),
             primary_selection_state: PrimarySelectionState::new::<Self>(dh),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
+            viewporter_state: ViewporterState::new::<Self>(dh),
+            fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
+            xdg_decoration_state: XdgDecorationState::new::<Self>(dh),
             space,
             popup_manager: PopupManager::default(),
-            default_output,
+            outputs,
             seat,
             pending_toplevels: Vec::new(),
             windows: Vec::new(),
@@ -292,6 +297,7 @@ impl ScryState {
             geometry,
             pid,
             activated,
+            scale: self.outputs.preferred_scale_for(&self.space, window),
         }
     }
 
@@ -466,11 +472,12 @@ impl ScryState {
                 let Some(surface_id) = self.surface_id_for(surface) else {
                     return;
                 };
+                let popup = self.popup_info(surface_id, surface);
                 self.mapped_popups.push(PopupRecord {
                     surface_id,
                     surface: surface.clone(),
+                    window_id: popup.window_id,
                 });
-                let popup = self.popup_info(surface_id, surface);
                 self.emit(|seq| CompositorEvent::PopupMapped { seq, popup });
             }
             (false, Some(pos)) => {
@@ -645,22 +652,59 @@ impl ScryState {
                     .iter()
                     .find(|record| record.id == id)
                     .ok_or(Error::UnknownWindow(id))
-                    .and_then(|record| render::render_window(&record.window));
+                    .and_then(|record| {
+                        let scale = self
+                            .outputs
+                            .preferred_scale_for(&self.space, &record.window);
+                        render::render_window(&record.window, scale)
+                    });
                 let _ = reply.send(outcome.map(|frame| Reply {
                     seq: self.seq,
                     value: frame,
                 }));
             }
             Command::CaptureOutput { name, reply } => {
-                let outcome = if name == self.default_output.name() {
-                    render::render_output(&self.space, &self.default_output)
-                } else {
-                    Err(Error::UnknownOutput(name))
-                };
+                let outcome = self
+                    .outputs
+                    .get(&name)
+                    .ok_or_else(|| Error::UnknownOutput(name.clone()))
+                    .and_then(|output| render::render_output(&self.space, output));
                 let _ = reply.send(outcome.map(|frame| Reply {
                     seq: self.seq,
                     value: frame,
                 }));
+            }
+            Command::Outputs { reply } => {
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: self.outputs.info(&self.space),
+                }));
+            }
+            Command::UpdateOutput { spec, reply } => {
+                let outcome = self
+                    .outputs
+                    .update(&self.display_handle, &mut self.space, spec)
+                    .map(|()| {
+                        self.seq += 1;
+                        Reply {
+                            seq: self.seq,
+                            value: (),
+                        }
+                    });
+                let _ = reply.send(outcome);
+            }
+            Command::RemoveOutput { name, reply } => {
+                let outcome = self
+                    .outputs
+                    .remove(&self.display_handle, &mut self.space, &name)
+                    .map(|()| {
+                        self.seq += 1;
+                        Reply {
+                            seq: self.seq,
+                            value: (),
+                        }
+                    });
+                let _ = reply.send(outcome);
             }
             Command::SetFrameClockMode { mode, reply } => {
                 self.frame_clock.set_mode(mode);
@@ -725,11 +769,14 @@ impl ScryState {
     /// the surface's occlusion state — the right semantics for a headless
     /// compositor.
     fn send_frames(&mut self, time: Duration) {
+        let Some(primary) = self.outputs.primary().cloned() else {
+            return;
+        };
         for record in &self.windows {
             record
                 .window
-                .send_frame(&self.default_output, time, Some(Duration::ZERO), |_, _| {
-                    Some(self.default_output.clone())
+                .send_frame(&primary, time, Some(Duration::ZERO), |_, _| {
+                    Some(primary.clone())
                 });
         }
         // Frame callbacks are protocol traffic; flush so clients observe
@@ -747,9 +794,65 @@ impl ScryState {
         }
     }
 
+    /// Republishes each mapped surface's scale hints (the
+    /// `wp_fractional_scale_v1` preferred scale and the `wl_surface` v6
+    /// `preferred_buffer_scale`) from the outputs its window overlaps.
+    ///
+    /// Both smithay helpers deduplicate internally, so this is a no-op
+    /// unless an overlap or a scale changed since the last tick.
+    fn update_scale_hints(&mut self) {
+        for record in &self.windows {
+            let scale = self
+                .outputs
+                .preferred_scale_for(&self.space, &record.window);
+            let Some(root) = record.window.wl_surface() else {
+                continue;
+            };
+            set_surface_tree_hints(&root, scale);
+            for (popup, _) in PopupManager::popups_for_surface(&root) {
+                set_surface_tree_hints(popup.wl_surface(), scale);
+            }
+        }
+    }
+
+    /// The scale hint appropriate for `surface`, resolved via its owning
+    /// window (or a popup's anchor window). Unmapped surfaces get the
+    /// primary output's scale.
+    fn scale_for_surface(&self, surface: &WlSurface) -> f64 {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        for record in &self.windows {
+            if record
+                .window
+                .wl_surface()
+                .map(|s| *s == root)
+                .unwrap_or(false)
+            {
+                return self
+                    .outputs
+                    .preferred_scale_for(&self.space, &record.window);
+            }
+        }
+        if let Some(window_id) = self
+            .mapped_popups
+            .iter()
+            .find(|record| record.surface == *surface)
+            .and_then(|record| record.window_id)
+            && let Some(record) = self.windows.iter().find(|record| record.id == window_id)
+        {
+            return self
+                .outputs
+                .preferred_scale_for(&self.space, &record.window);
+        }
+        self.outputs.primary_scale()
+    }
+
     /// Bookkeeping run after every event-loop dispatch.
     fn post_tick(&mut self) {
         self.space.refresh();
+        self.update_scale_hints();
         self.popup_manager.cleanup();
         if let Err(err) = self.display_handle.flush_clients() {
             debug!("failed to flush clients: {err}");
@@ -852,6 +955,49 @@ impl OutputHandler for ScryState {
     fn output_bound(&mut self, _output: Output, _wl_output: WlOutput) {}
 }
 
+impl FractionalScaleHandler for ScryState {
+    /// A client bound `wp_fractional_scale_v1` for `surface`: publish the
+    /// scale the surface's window already prefers. (smithay also replays any
+    /// pre-filled preferred scale to the fresh object, so a surface that
+    /// received hints before binding is covered both ways.)
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self.scale_for_surface(&surface);
+        with_states(&surface, |states| {
+            crate::output::apply_scale_hints(&surface, states, scale);
+        });
+    }
+}
+
+impl XdgDecorationHandler for ScryState {
+    /// A client created a `zxdg_toplevel_decoration_v1`: report the
+    /// compositor's standing preference. We draw no window chrome of our
+    /// own, so `ServerSide` merely means "the client should not render
+    /// decorations" — the standard headless answer.
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    /// The client expressed a mode preference; honor it so negotiation
+    /// always converges.
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(mode);
+        });
+        toplevel.send_configure();
+    }
+
+    /// The client retracted its preference; fall back to the compositor's.
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
 impl SeatHandler for ScryState {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -873,8 +1019,24 @@ impl SeatHandler for ScryState {
 smithay::delegate_compositor!(ScryState);
 smithay::delegate_shm!(ScryState);
 smithay::delegate_xdg_shell!(ScryState);
+smithay::delegate_xdg_decoration!(ScryState);
 smithay::delegate_output!(ScryState);
 smithay::delegate_seat!(ScryState);
+smithay::delegate_viewporter!(ScryState);
+smithay::delegate_fractional_scale!(ScryState);
+
+/// Applies `scale` hints to every surface in `root`'s subsurface tree.
+fn set_surface_tree_hints(root: &WlSurface, scale: f64) {
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |surface, states, _| {
+            apply_scale_hints(surface, states, scale);
+        },
+        |_, _, _| true,
+    );
+}
 
 // -- event loop entry point ---------------------------------------------------
 

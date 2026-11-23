@@ -12,7 +12,7 @@ use smithay::{
     desktop::{PopupManager, Space, Window},
     output::Output,
     reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_shm, wl_surface::WlSurface},
-    utils::{Buffer as BufferCoord, Logical, Point, Size, Transform},
+    utils::{Buffer as BufferCoord, Logical, Physical, Point, Size, Transform},
     wayland::{
         compositor::{SurfaceData, TraversalAction, with_surface_tree_upward},
         seat::WaylandFocus,
@@ -30,39 +30,52 @@ use crate::{error::Error, frame::Frame};
 /// The capture is occlusion-free: sibling windows and output edges are
 /// ignored. The frame covers `window.bbox_with_popups()`, so it may extend
 /// beyond the toplevel's own geometry.
-pub(crate) fn render_window(window: &Window) -> Result<Frame, Error> {
+///
+/// The frame renders at `scale` — the preferred scale advertised to the
+/// window's surfaces — so HiDPI buffers land on integer pixel boundaries.
+pub(crate) fn render_window(window: &Window, scale: f64) -> Result<Frame, Error> {
     let bbox = window.bbox_with_popups();
     let Some(mut pixmap) = Pixmap::new(
-        u32::try_from(bbox.size.w).unwrap_or(0),
-        u32::try_from(bbox.size.h).unwrap_or(0),
+        (bbox.size.w as f64 * scale).ceil().max(0.0) as u32,
+        (bbox.size.h as f64 * scale).ceil().max(0.0) as u32,
     ) else {
         return Err(Error::Capture("window has no compositable content".into()));
     };
 
     if let Some(surface) = window.wl_surface() {
-        draw_surface_tree(&mut pixmap, &surface, Point::from((0, 0)) - bbox.loc);
+        draw_surface_tree(&mut pixmap, &surface, Point::from((0, 0)) - bbox.loc, scale);
         for (popup, location) in PopupManager::popups_for_surface(&surface) {
             let origin = window.geometry().loc + location - popup.geometry().loc - bbox.loc;
-            draw_surface_tree(&mut pixmap, popup.wl_surface(), origin);
+            draw_surface_tree(&mut pixmap, popup.wl_surface(), origin, scale);
         }
     }
     Ok(Frame::from_pixmap(pixmap))
 }
 
 /// Renders every visible window overlapping `output`, in z-order, into a
-/// frame covering the output's logical geometry over opaque black.
+/// frame covering the output's physical (mode) pixels over opaque black.
+///
+/// Logical space is upscaled by the output's advertised scale, so
+/// `buffer_scale`-aware surfaces land on the output 1:1.
 pub(crate) fn render_output(space: &Space<Window>, output: &Output) -> Result<Frame, Error> {
     let geometry = space
         .output_geometry(output)
         .ok_or_else(|| Error::Capture("output is not mapped".into()))?;
+    let physical = output.current_transform().transform_size(
+        output
+            .current_mode()
+            .map(|mode| mode.size)
+            .unwrap_or_default(),
+    );
     let Some(mut pixmap) = Pixmap::new(
-        u32::try_from(geometry.size.w).unwrap_or(0),
-        u32::try_from(geometry.size.h).unwrap_or(0),
+        u32::try_from(physical.w).unwrap_or(0),
+        u32::try_from(physical.h).unwrap_or(0),
     ) else {
         return Err(Error::Capture("output has no compositable area".into()));
     };
     pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 255));
 
+    let scale = output.current_scale().fractional_scale();
     // `space.elements()` iterates in z-order, back to front.
     for window in space.elements() {
         let Some(element_loc) = space.element_location(window) else {
@@ -77,10 +90,10 @@ pub(crate) fn render_output(space: &Space<Window>, output: &Output) -> Result<Fr
             continue;
         }
         if let Some(surface) = window.wl_surface() {
-            draw_surface_tree(&mut pixmap, &surface, render_loc);
+            draw_surface_tree(&mut pixmap, &surface, render_loc, scale);
             for (popup, location) in PopupManager::popups_for_surface(&surface) {
                 let origin = element_loc + location - popup.geometry().loc - geometry.loc;
-                draw_surface_tree(&mut pixmap, popup.wl_surface(), origin);
+                draw_surface_tree(&mut pixmap, popup.wl_surface(), origin, scale);
             }
         }
     }
@@ -88,8 +101,14 @@ pub(crate) fn render_output(space: &Space<Window>, output: &Output) -> Result<Fr
 }
 
 /// Draws `root` and its subsurface tree into `target`, treating `origin` as
-/// the target position of `root`'s surface-local `(0, 0)`.
-fn draw_surface_tree(target: &mut Pixmap, root: &WlSurface, origin: Point<i32, Logical>) {
+/// the target position of `root`'s surface-local `(0, 0)` in logical
+/// coordinates; `scale` converts logical coordinates into target pixels.
+fn draw_surface_tree(
+    target: &mut Pixmap,
+    root: &WlSurface,
+    origin: Point<i32, Logical>,
+    scale: f64,
+) {
     let target = &mut target.as_mut();
     // `with_surface_tree_upward` iterates bottom-to-top — paint order.
     // (`with_surface_tree_downward` is top-to-bottom, used for hit-testing.)
@@ -109,7 +128,7 @@ fn draw_surface_tree(target: &mut Pixmap, root: &WlSurface, origin: Point<i32, L
             }
         },
         |_surface, states, loc| {
-            draw_surface(target, states, *loc);
+            draw_surface(target, states, *loc, scale);
         },
         |_, _, _| true,
     );
@@ -123,12 +142,14 @@ fn surface_view(states: &SurfaceData) -> Option<SurfaceView> {
         .and_then(|data| data.lock().unwrap().view())
 }
 
-/// Draws a single surface's buffer at `loc` (its tree-relative position,
-/// before `view.offset` is applied).
+/// Draws a single surface's buffer at `loc` (its tree-relative position in
+/// logical coordinates, before `view.offset` is applied), upscaling logical
+/// space into target pixels by `scale`.
 fn draw_surface(
     target: &mut tiny_skia::PixmapMut<'_>,
     states: &SurfaceData,
     loc: Point<i32, Logical>,
+    scale: f64,
 ) {
     let Some(parts) = states
         .data_map
@@ -146,7 +167,8 @@ fn draw_surface(
         return;
     }
 
-    // Affine: buffer pixels -> logical surface space -> target.
+    // Affine: buffer pixels -> logical surface space -> scaled target
+    // pixels.
     let buffer_size: Size<i32, BufferCoord> =
         (buffer_pixmap.width() as i32, buffer_pixmap.height() as i32).into();
     let buf_to_logical = buffer_to_logical_matrix(parts.transform, buffer_size, parts.scale);
@@ -159,14 +181,20 @@ fn draw_surface(
             .post_concat(tiny_skia::Transform::from_translate(
                 position.x as f32,
                 position.y as f32,
-            ));
+            ))
+            .post_concat(tiny_skia::Transform::from_scale(scale as f32, scale as f32));
     let transform = buf_to_logical.post_concat(logical_to_target);
 
     // When the view crops (`wp_viewport.set_source`), pixels outside `src`
     // map outside `dst`; clip them away so they cannot bleed.
     let cropped = view.src.loc != (0.0, 0.0).into() || view.src.size != parts.logical_size.to_f64();
     let mask = if cropped {
-        clip_mask(target.width(), target.height(), position, view.dst)
+        clip_mask(
+            target.width(),
+            target.height(),
+            position.to_f64().to_physical(scale),
+            view.dst.to_f64().to_physical(scale),
+        )
     } else {
         None
     };
@@ -295,12 +323,13 @@ fn buffer_to_logical_matrix(
     )
 }
 
-/// An alpha mask restricting drawing to `rect` within a `w * h` target.
+/// An alpha mask restricting drawing to `rect` (in target pixels) within a
+/// `w * h` target.
 fn clip_mask(
     w: u32,
     h: u32,
-    position: Point<i32, Logical>,
-    size: Size<i32, Logical>,
+    position: Point<f64, Physical>,
+    size: Size<f64, Physical>,
 ) -> Option<tiny_skia::Mask> {
     let mut mask = tiny_skia::Mask::new(w, h)?;
     let rect = tiny_skia::Rect::from_xywh(
