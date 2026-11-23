@@ -130,9 +130,14 @@ impl ScryState {
         x: f64,
         y: f64,
     ) -> Result<()> {
-        let point: Point<f64, Logical> = (x, y).into();
-        let focus = match target {
-            PointerTarget::Output => self.pointer_focus_at(point),
+        if !x.is_finite() || !y.is_finite() {
+            return Err(Error::InvalidCoordinates(x, y));
+        }
+        let (location, focus) = match target {
+            PointerTarget::Output => {
+                let point: Point<f64, Logical> = (x, y).into();
+                (point, self.pointer_focus_at(point))
+            }
             PointerTarget::Window(id) => {
                 let window = &self
                     .windows
@@ -140,17 +145,23 @@ impl ScryState {
                     .find(|r| r.id == id)
                     .ok_or(Error::UnknownWindow(id))?
                     .window;
-                // The surface tree root sits at render_location: the element's
-                // mapped position shifted by the client window geometry.
-                let render_loc = self
+                // `(x, y)` is relative to the window's logical geometry
+                // origin — `element_location` is where `map_element` placed
+                // it. The surface tree root sits at `render_loc`, shifted by
+                // the client-declared window geometry (e.g. CSD shadows).
+                let element_loc = self
                     .space
                     .element_location(window)
-                    .map(|loc| loc - window.geometry().loc)
                     .ok_or(Error::UnknownWindow(id))?;
+                let global_point = element_loc.to_f64() + Point::from((x, y));
+                let render_loc = element_loc - window.geometry().loc;
                 let (surface, offset) = window
-                    .surface_under(point - render_loc.to_f64(), WindowSurfaceType::ALL)
+                    .surface_under(global_point - render_loc.to_f64(), WindowSurfaceType::ALL)
                     .ok_or(Error::OutsideWindow(id))?;
-                Some((surface, (render_loc + offset).to_f64()))
+                (
+                    global_point,
+                    Some((surface, (render_loc + offset).to_f64())),
+                )
             }
         };
         let pointer = self.pointer.clone();
@@ -158,7 +169,7 @@ impl ScryState {
             self,
             focus,
             &MotionEvent {
-                location: point,
+                location,
                 serial: SERIAL_COUNTER.next_serial(),
                 time: self.now_ms(),
             },
@@ -202,6 +213,9 @@ impl ScryState {
     /// `x`/`y` are continuous axis deltas; 15.0 units correspond to one wheel
     /// detent and are also reported through `wl_pointer.axis_v120`.
     pub(crate) fn cmd_pointer_scroll(&mut self, x: f64, y: f64) -> Result<()> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(Error::InvalidCoordinates(x, y));
+        }
         let mut frame = AxisFrame::new(self.now_ms()).source(AxisSource::Wheel);
         if x != 0.0 {
             frame = frame
@@ -351,12 +365,18 @@ impl ScryState {
             return Ok(());
         }
 
-        // Layer 1 fallback: physical XKB key events.
+        // Layer 1 fallback: physical XKB key events. The whole string is
+        // resolved up front so an unmappable character fails atomically
+        // instead of leaving a partially typed prefix behind.
+        let mut keys = Vec::with_capacity(text.len());
         for ch in text.chars() {
             let sym = keymap::char_keysym(ch).ok_or(Error::UnmappableCharacter(ch))?;
-            let resolved = self
-                .with_keymap(|keymap| keymap::resolve_keycode(keymap, sym))
-                .ok_or(Error::UnmappableCharacter(ch))?;
+            keys.push(
+                self.with_keymap(|keymap| keymap::resolve_keycode(keymap, sym))
+                    .ok_or(Error::UnmappableCharacter(ch))?,
+            );
+        }
+        for resolved in keys {
             for &m in &resolved.modifiers {
                 self.press_keycode(m);
             }

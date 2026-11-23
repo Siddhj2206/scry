@@ -50,6 +50,11 @@ pub enum Error {
     #[error("invalid pointer button code: {0:#x}")]
     InvalidButton(u32),
 
+    /// A pointer motion or scroll carried a non-finite coordinate
+    /// (`NaN`/`±∞`), which the protocol cannot represent.
+    #[error("non-finite pointer coordinate: ({0}, {1})")]
+    InvalidCoordinates(f64, f64),
+
     /// A window-local pointer target fell outside the window's surfaces
     /// (including its subsurfaces and popups).
     #[error("point is outside window {0:?}")]

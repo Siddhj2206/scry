@@ -656,10 +656,12 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_pointer_motion(target, x, y);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::PointerButton {
@@ -668,18 +670,22 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_pointer_button(button, pressed);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::PointerScroll { x, y, reply } => {
                 let outcome = self.cmd_pointer_scroll(x, y);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::KeyEvent {
@@ -688,10 +694,12 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_key_event(&name, pressed);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::KeyCombo {
@@ -700,26 +708,32 @@ impl ScryState {
                 reply,
             } => {
                 let outcome = self.cmd_key_combo(&name, &modifiers);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::TypeText { text, reply } => {
                 let outcome = self.cmd_type_text(&text);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::FocusWindow { id, reply } => {
                 let outcome = self.cmd_focus_window(id);
-                self.seq += 1;
-                let _ = reply.send(outcome.map(|value| Reply {
-                    seq: self.seq,
-                    value,
+                let _ = reply.send(outcome.map(|value| {
+                    self.seq += 1;
+                    Reply {
+                        seq: self.seq,
+                        value,
+                    }
                 }));
             }
             Command::Shutdown { reply } => {

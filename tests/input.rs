@@ -159,6 +159,76 @@ fn pointer_motion_in_window_local_coordinates() {
 }
 
 #[test]
+fn window_local_motion_honours_the_window_geometry_origin() {
+    let compositor = Compositor::spawn().unwrap();
+    let handle = compositor.handle().clone();
+    let events = handle.subscribe().unwrap();
+
+    let mut client = TestClient::connect(handle.socket_path());
+    // A CSD-style toplevel: the buffer is larger than the declared window
+    // geometry, whose origin sits at (20, 30) inside the surface (like
+    // GTK4 shadow margins).
+    let surface = client.compositor.create_surface(&client.qh, ());
+    let xsurface = client.wm_base.get_xdg_surface(&surface, &client.qh, ());
+    let _toplevel = xsurface.get_toplevel(&client.qh, ());
+    xsurface.set_window_geometry(20, 30, 100, 80);
+    surface.commit();
+    client.pump_until(|s| !s.configure_serials.is_empty());
+    let buffer = client.shm_buffer(140, 140, 0xff33_6699);
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    client.roundtrip();
+    let mapped = wait_for_event(&events, |e| {
+        matches!(e, CompositorEvent::WindowMapped { .. })
+    });
+    let CompositorEvent::WindowMapped { window, .. } = mapped else {
+        unreachable!()
+    };
+
+    // (10, 15) relative to the geometry origin lands at surface-local
+    // (30, 45) once the geometry offset is taken into account.
+    handle
+        .move_pointer(PointerTarget::Window(window.id), 10.0, 15.0)
+        .unwrap();
+    client.pump_until(|s| s.pointer_enters.iter().any(|(surf, _, _)| *surf == surface));
+    let (_, x, y) = client
+        .state
+        .pointer_enters
+        .iter()
+        .find(|(surf, _, _)| *surf == surface)
+        .unwrap();
+    assert_eq!((*x, *y), (30.0, 45.0));
+}
+
+#[test]
+fn type_text_with_an_unmappable_character_is_atomic() {
+    let compositor = Compositor::spawn().unwrap();
+    let handle = compositor.handle().clone();
+    let events = handle.subscribe().unwrap();
+
+    let mut client = TestClient::connect(handle.socket_path());
+    let toplevel = client.map_toplevel(100, 100, "org.scry.Atom", "Atom");
+    wait_for_event(&events, |e| {
+        matches!(e, CompositorEvent::WindowMapped { .. })
+    });
+    pump_kb_enter(&mut client, &toplevel.surface);
+
+    // "🚀" has no keysym on the keymap: the whole command must fail without
+    // typing the "ok" prefix first.
+    let err = handle.type_text("ok\u{1f680}").unwrap_err();
+    assert!(
+        matches!(err, scry::Error::UnmappableCharacter('\u{1f680}')),
+        "got {err:?}"
+    );
+    client.roundtrip();
+    assert!(
+        client.state.keys.is_empty(),
+        "failed type_text must not emit key events: {:?}",
+        client.state.keys
+    );
+}
+
+#[test]
 fn clicking_an_unfocused_toplevel_raises_and_focuses_it() {
     let compositor = Compositor::spawn().unwrap();
     let handle = compositor.handle().clone();
@@ -528,4 +598,31 @@ fn invalid_input_returns_explicit_errors() {
     assert!(matches!(err, scry::Error::UnknownWindow(_)), "got {err:?}");
     let err = handle.focus_window(WindowId(999_999)).unwrap_err();
     assert!(matches!(err, scry::Error::UnknownWindow(_)), "got {err:?}");
+
+    // Non-finite pointer coordinates fail loudly, for both motion targets
+    // and scroll deltas.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let err = handle
+            .move_pointer(PointerTarget::Output, bad, 0.0)
+            .unwrap_err();
+        assert!(
+            matches!(err, scry::Error::InvalidCoordinates(..)),
+            "got {err:?}"
+        );
+        let err = handle
+            .move_pointer(PointerTarget::Output, 0.0, bad)
+            .unwrap_err();
+        assert!(
+            matches!(err, scry::Error::InvalidCoordinates(..)),
+            "got {err:?}"
+        );
+        let err = handle.scroll_pointer(bad, 0.0).unwrap_err();
+        assert!(
+            matches!(err, scry::Error::InvalidCoordinates(..)),
+            "got {err:?}"
+        );
+    }
+    // And a failed command must not have delivered any pointer events.
+    client.roundtrip();
+    assert!(client.state.pointer_axis.is_empty());
 }

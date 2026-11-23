@@ -247,13 +247,25 @@ fn buffer_pixmap(buffer: &WlBuffer) -> Option<Pixmap> {
 }
 
 fn copy_buffer(ptr: *const u8, len: usize, data: BufferData) -> Option<Pixmap> {
+    // These dimensions come straight from the client's `create_buffer`
+    // request: reject anything non-positive before casting to `usize`,
+    // where negative `i32`s would wrap into huge offsets.
+    if data.width <= 0 || data.height <= 0 || data.stride <= 0 || data.offset < 0 {
+        warn!(
+            "shm buffer with invalid geometry: {}x{} stride {} offset {}",
+            data.width, data.height, data.stride, data.offset
+        );
+        return None;
+    }
     let (w, h, stride, offset) = (
         data.width as usize,
         data.height as usize,
         data.stride as usize,
         data.offset as usize,
     );
-    if w == 0 || h == 0 {
+    // The stride must cover a full row of pixels.
+    if stride < w * 4 {
+        warn!("shm buffer stride {stride} too small for width {w}");
         return None;
     }
     let byte_len = (h - 1).checked_mul(stride)?.checked_add(w * 4)?;
@@ -346,4 +358,55 @@ fn clip_mask(
         tiny_skia::Transform::default(),
     );
     Some(mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_data(width: i32, height: i32, stride: i32, offset: i32) -> BufferData {
+        BufferData {
+            offset,
+            width,
+            height,
+            stride,
+            format: wl_shm::Format::Argb8888,
+        }
+    }
+
+    #[test]
+    fn copy_buffer_rejects_invalid_shm_dimensions() {
+        let backing = [0u8; 64];
+        // Non-positive dimensions must never reach the `usize` casts or the
+        // `from_raw_parts` slice below: negative i32s would wrap huge.
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(0, 4, 16, 0)).is_none());
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(-4, 4, 16, 0)).is_none());
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, -4, 16, 0)).is_none());
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, 4, 0, 0)).is_none());
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, 4, -16, 0)).is_none());
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, 4, 16, -4)).is_none());
+        // A stride that cannot hold a full row of pixels.
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, 4, 8, 0)).is_none());
+        // Reads past the end of the mapping.
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, 4, 16, 48)).is_none());
+        assert!(copy_buffer(backing.as_ptr(), 64, buffer_data(4, 5, 16, 0)).is_none());
+    }
+
+    #[test]
+    fn copy_buffer_accepts_a_tightly_packed_valid_buffer() {
+        // 2x2 Argb8888 (little-endian B,G,R,A).
+        let mut backing = Vec::new();
+        for argb in [0xff11_2233u32, 0xff44_5566, 0xff77_8899, 0xffaa_bbcc] {
+            backing.extend_from_slice(&argb.to_le_bytes());
+        }
+        let pixmap = copy_buffer(backing.as_ptr(), backing.len(), buffer_data(2, 2, 8, 0))
+            .expect("valid buffer must copy");
+        assert_eq!((pixmap.width(), pixmap.height()), (2, 2));
+        // B,G,R,A -> premultiplied R,G,B,A: opaque alpha stays verbatim.
+        let pixel = pixmap.pixel(0, 0).unwrap();
+        assert_eq!(
+            (pixel.alpha(), pixel.red(), pixel.green(), pixel.blue()),
+            (0xff, 0x11, 0x22, 0x33)
+        );
+    }
 }

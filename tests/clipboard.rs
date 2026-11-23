@@ -558,6 +558,37 @@ fn client_primary_selection_emits_event_and_reads_back() {
 }
 
 #[test]
+fn large_compositor_selection_streams_without_deadlock() {
+    let compositor = Compositor::spawn().unwrap();
+    let handle = compositor.handle().clone();
+    let events = handle.subscribe().unwrap();
+
+    let mut client = SelectionClient::connect(&compositor);
+    let _toplevel = client.map_toplevel(100, 100, "org.scry.Big", "Big");
+    let _ = wait_for_event(&events, |e| {
+        matches!(e, CompositorEvent::WindowMapped { .. })
+    });
+
+    // Far larger than any OS pipe/socket buffer (~64 KiB): a synchronous
+    // `write_all` on the compositor thread would block forever, because
+    // this single-threaded client only starts reading after its `receive`
+    // request + roundtrip return. The compositor must stream the payload
+    // through its event loop instead.
+    let payload: Vec<u8> = (0u32..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    handle
+        .set_selection(
+            SelectionKind::Clipboard,
+            TEXT_MIME.to_string(),
+            payload.clone(),
+        )
+        .expect("set_selection failed");
+
+    client.pump_until(|s| s.clipboard.has_selection);
+    let data = client.receive_clipboard(TEXT_MIME);
+    assert_eq!(data, payload);
+}
+
+#[test]
 fn selection_errors_and_clear_are_structured() {
     let compositor = Compositor::spawn().unwrap();
     let handle = compositor.handle().clone();

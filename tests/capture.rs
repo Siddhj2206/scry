@@ -488,3 +488,20 @@ fn hidpi_buffer_scale_captures_at_logical_size() {
     assert_eq!(pixel_at(&frame, 4, 16), rgba(0xffff_0000));
     assert_eq!(pixel_at(&frame, 28, 16), rgba(0xff00_00ff));
 }
+
+#[test]
+fn frame_pixel_panics_on_out_of_bounds_coordinates() {
+    let frame = Frame {
+        width: 2,
+        height: 2,
+        pixels: vec![0u8; 2 * 2 * 4],
+    };
+    // In-bounds reads work.
+    let _ = frame.pixel(1, 1);
+    // An out-of-range x would silently wrap into the next row without the
+    // bounds check; both coordinates must panic instead.
+    let wrapped = std::panic::catch_unwind(|| frame.pixel(2, 0));
+    assert!(wrapped.is_err(), "x == width must panic");
+    let overflow = std::panic::catch_unwind(|| frame.pixel(0, 2));
+    assert!(overflow.is_err(), "y == height must panic");
+}

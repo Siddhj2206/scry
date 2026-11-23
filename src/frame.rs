@@ -26,6 +26,13 @@ pub struct Frame {
 impl Frame {
     /// The RGBA8 pixel at `(x, y)`; panics when out of bounds.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        // An out-of-bounds `x` must panic here, not wrap into the next row.
+        assert!(
+            x < self.width && y < self.height,
+            "pixel ({x}, {y}) out of bounds for a {}x{} frame",
+            self.width,
+            self.height
+        );
         let offset = ((y * self.width + x) * 4) as usize;
         self.pixels[offset..offset + 4].try_into().unwrap()
     }

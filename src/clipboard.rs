@@ -24,6 +24,7 @@ use smithay::{
     input::Seat,
     reexports::{
         calloop::{Interest, Mode, PostAction, generic::Generic},
+        rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl},
         wayland_server::protocol::wl_data_device_manager::DndAction,
     },
     wayland::selection::{
@@ -376,6 +377,13 @@ impl SelectionHandler for ScryState {
 
     /// A client asked to read a compositor-provided selection: write the
     /// stored bytes for the negotiated `mime_type` into `fd`.
+    ///
+    /// The pipe is written non-blocking — small payloads complete inline,
+    /// while anything exceeding the OS pipe buffer (~64 KiB) streams out
+    /// through a `WRITE` interest on the event loop as the client drains
+    /// it. A synchronous `write_all` here would deadlock the compositor
+    /// thread: the client only starts reading after its `receive` request
+    /// returns.
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
@@ -388,9 +396,64 @@ impl SelectionHandler for ScryState {
             warn!(?ty, %mime_type, "client requested unoffered selection mime type");
             return;
         };
+        // `fd` may be a pipe or a socket end: `File` writes to both (a
+        // `UnixStream` would issue `send(2)`, which fails on pipes), so it
+        // is made non-blocking with an explicit `fcntl` instead.
+        match fcntl_getfl(&fd).map(|flags| flags | OFlags::NONBLOCK) {
+            Ok(flags) => {
+                if let Err(err) = fcntl_setfl(&fd, flags) {
+                    warn!(?ty, %mime_type, "failed to make selection fd non-blocking: {err}");
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!(?ty, %mime_type, "failed to make selection fd non-blocking: {err}");
+                return;
+            }
+        }
         let mut file = std::fs::File::from(fd);
-        if let Err(err) = file.write_all(data) {
-            warn!(?ty, %mime_type, "failed to write selection contents: {err}");
+        let mut written = match file.write(data) {
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(err) => {
+                warn!(?ty, %mime_type, "failed to write selection contents: {err}");
+                return;
+            }
+        };
+        if written == data.len() {
+            return;
+        }
+        // The payload did not fit into the pipe buffer: stream the rest on
+        // the event loop (mirroring `watch_selection_read`).
+        let data = data.to_vec();
+        let result = self.loop_handle.insert_source(
+            Generic::new(file, Interest::WRITE, Mode::Level),
+            move |_, file, _state| {
+                // `Generic` hands back `&mut NoIoDrop<File>`; `Write` is
+                // implemented for `&File`, so bind the reference.
+                let mut file = &**file;
+                match file.write(&data[written..]) {
+                    Ok(0) => Ok(PostAction::Remove),
+                    Ok(n) => {
+                        written += n;
+                        if written == data.len() {
+                            Ok(PostAction::Remove)
+                        } else {
+                            Ok(PostAction::Continue)
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        Ok(PostAction::Continue)
+                    }
+                    Err(err) => {
+                        warn!("failed to write selection contents: {err}");
+                        Ok(PostAction::Remove)
+                    }
+                }
+            },
+        );
+        if result.is_err() {
+            warn!(?ty, %mime_type, "failed to register selection write source on the event loop");
         }
     }
 }
