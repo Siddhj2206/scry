@@ -90,9 +90,13 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::windows::CAPTURE_WINDOW,
     crate::daemon::methods::windows::CAPTURE_WORKSPACE,
     crate::daemon::methods::windows::GET_DAMAGE,
+    crate::daemon::methods::changes::GET_CHANGES_SINCE,
+    crate::daemon::methods::changes::MARK_SET,
+    crate::daemon::methods::changes::MARK_LIST,
     crate::daemon::methods::waits::WAIT_FOR_WINDOW,
     crate::daemon::methods::waits::WAIT_FOR_COMMIT,
     crate::daemon::methods::waits::WAIT_FOR_IDLE,
+    crate::daemon::methods::status::STATUS,
 ];
 
 /// Dispatches one request to its verb and wraps the payload in the standard

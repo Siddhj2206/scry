@@ -20,11 +20,14 @@
 //!                                       └───────────────────────────────┘
 //! ```
 
+mod changelog;
 pub mod methods;
 pub mod process;
 pub mod protocol;
 pub mod registry;
 pub mod router;
+
+pub use changelog::DEFAULT_CAPACITY as DEFAULT_CHANGE_LOG_CAPACITY;
 
 use std::{
     io,
@@ -66,16 +69,22 @@ pub struct DaemonConfig {
     pub default_idle_ttl: Duration,
     /// How often the idle reaper scans workspaces.
     pub reaper_interval: Duration,
+    /// Compositor events retained per workspace for `get_changes_since`
+    /// diffs. Smaller buffers truncate sooner; a `truncated` diff always
+    /// carries a resync hint.
+    pub change_log_capacity: usize,
 }
 
 impl DaemonConfig {
-    /// Sensible defaults: 5-minute workspace idle TTL, 1-second reaper scans.
+    /// Sensible defaults: 5-minute workspace idle TTL, 1-second reaper
+    /// scans, [`DEFAULT_CHANGE_LOG_CAPACITY`] retained events.
     pub fn new(socket_path: PathBuf, state_dir: PathBuf) -> Self {
         Self {
             socket_path,
             state_dir,
             default_idle_ttl: Duration::from_secs(300),
             reaper_interval: Duration::from_secs(1),
+            change_log_capacity: changelog::DEFAULT_CAPACITY,
         }
     }
 }
@@ -87,7 +96,6 @@ pub struct DaemonContext {
     /// The live workspace registry.
     pub registry: WorkspaceRegistry,
     /// When the daemon started serving (for `status` diagnostics).
-    #[allow(dead_code)]
     pub started_at: Instant,
 }
 
@@ -224,7 +232,11 @@ async fn serve(
     let _ = ready.send(Ok(()));
 
     let ctx = Arc::new(DaemonContext {
-        registry: WorkspaceRegistry::new(config.state_dir.clone(), config.default_idle_ttl),
+        registry: WorkspaceRegistry::new(
+            config.state_dir.clone(),
+            config.default_idle_ttl,
+            config.change_log_capacity,
+        ),
         config: config.clone(),
         started_at: Instant::now(),
     });

@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use crate::{
     Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
     daemon::{
+        changelog::{ChangeLog, Mark},
         process::{ProcessInfo, ProcessRegistry, SpawnSpec},
         protocol::{ErrorResponse, code},
     },
@@ -148,8 +149,12 @@ pub struct Workspace {
     recent: Arc<Mutex<VecDeque<CompositorEvent>>>,
     /// Managed children spawned by `spawn_app`, tracked until teardown.
     processes: ProcessRegistry,
-    /// Highest sequence number observed (events and command replies).
-    /// Shared with the event-pump thread.
+    /// Bounded seq-indexed event log plus named marks — the state behind
+    /// `get_changes_since`, `mark_set` and `mark_list`. Shared with the
+    /// event-pump thread.
+    change_log: Arc<Mutex<ChangeLog>>,
+    /// Highest sequence number observed (events, command replies and
+    /// marks). Shared with the event-pump thread.
     seq: Arc<AtomicU64>,
     /// Wall-clock time of the last compositor event (not command) — the
     /// baseline `wait_for_idle` measures its quiet window from.
@@ -168,6 +173,7 @@ impl Workspace {
         id: String,
         options: ResolvedOptions,
         state_dir: PathBuf,
+        change_log_capacity: usize,
     ) -> Result<Self, ErrorResponse> {
         let compositor = tokio::task::spawn_blocking(Compositor::spawn)
             .await
@@ -189,12 +195,14 @@ impl Workspace {
         let last_event_ms = Arc::new(AtomicU64::new(now_ms()));
         let last_active_ms = Arc::new(AtomicU64::new(now_ms()));
         let recent = Arc::new(Mutex::new(VecDeque::new()));
+        let change_log = Arc::new(Mutex::new(ChangeLog::new(change_log_capacity)));
         let pump = {
             let events = events.clone();
             let seq = seq.clone();
             let last_event = last_event_ms.clone();
             let last_active = last_active_ms.clone();
             let recent = recent.clone();
+            let change_log = change_log.clone();
             std::thread::Builder::new()
                 .name(format!("scry-ws-events-{id}"))
                 .spawn(move || {
@@ -208,6 +216,10 @@ impl Workspace {
                         }
                         ring.push_back(event.clone());
                         drop(ring);
+                        change_log
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record(&event);
                         // No subscribers yet is fine — broadcast for verbs
                         // that need it (wait_*, get_changes_since).
                         let _ = events.send(event);
@@ -228,6 +240,7 @@ impl Workspace {
             events,
             recent,
             processes: ProcessRegistry::new(),
+            change_log,
             seq,
             last_event_ms,
             active_waits: Arc::new(AtomicUsize::new(0)),
@@ -307,7 +320,7 @@ impl Workspace {
     }
 
     /// Whether the workspace currently holds a live compositor.
-    fn is_live(&self) -> bool {
+    pub fn is_live(&self) -> bool {
         self.compositor
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -346,9 +359,39 @@ impl Workspace {
     }
 
     /// Health snapshots of every child spawned into this workspace — the
-    /// process detail behind `workspace_list` and M2.4's `status`.
+    /// process detail behind `workspace_list` and `status`.
     pub fn process_snapshot(&self) -> Vec<ProcessInfo> {
         self.processes.snapshot()
+    }
+
+    /// Attaches a named mark to the workspace's seq timeline (`mark_set`).
+    ///
+    /// The mark occupies a fresh timeline point: `seq` is advanced while
+    /// the log is locked so marks stay in seq order, and the new point is
+    /// always visible to the next `get_changes_since` call rather than
+    /// hiding behind an already-reported seq.
+    pub fn set_mark(&self, name: String, metadata: Option<Value>) -> Mark {
+        let mut log = self.change_log.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        log.set_mark(name, metadata, seq, now_ms())
+    }
+
+    /// Every named mark on the timeline, in seq order (`mark_list`).
+    pub fn marks(&self) -> Vec<Mark> {
+        self.change_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .marks()
+            .to_vec()
+    }
+
+    /// The deduplicated structured diff over `(since, current_seq]`
+    /// (`get_changes_since`).
+    pub fn changes_since(&self, since: Seq) -> Value {
+        self.change_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diff(since, self.seq())
     }
 
     /// Runs a blocking `CompositorHandle` command off the async reactor and
@@ -478,16 +521,19 @@ pub struct WorkspaceRegistry {
     create_guard: tokio::sync::Mutex<()>,
     state_dir: PathBuf,
     default_idle_ttl_ms: u64,
+    /// Retained change-log events per workspace (`get_changes_since`).
+    change_log_capacity: usize,
 }
 
 impl WorkspaceRegistry {
     /// An empty registry persisting metadata under `state_dir`.
-    pub fn new(state_dir: PathBuf, default_idle_ttl: Duration) -> Self {
+    pub fn new(state_dir: PathBuf, default_idle_ttl: Duration, change_log_capacity: usize) -> Self {
         Self {
             workspaces: Mutex::new(HashMap::new()),
             create_guard: tokio::sync::Mutex::new(()),
             state_dir,
             default_idle_ttl_ms: default_idle_ttl.as_millis() as u64,
+            change_log_capacity,
         }
     }
 
@@ -538,8 +584,15 @@ impl WorkspaceRegistry {
             ));
         }
 
-        let workspace =
-            Arc::new(Workspace::spawn(id.to_string(), resolved, self.state_dir.clone()).await?);
+        let workspace = Arc::new(
+            Workspace::spawn(
+                id.to_string(),
+                resolved,
+                self.state_dir.clone(),
+                self.change_log_capacity,
+            )
+            .await?,
+        );
         info!(workspace = id, "workspace created");
         self.workspaces
             .lock()
@@ -565,6 +618,14 @@ impl WorkspaceRegistry {
                     json!({"workspace": id}),
                 )
             })
+    }
+
+    /// Every live workspace, in creation order (`status`).
+    pub fn all(&self) -> Vec<Arc<Workspace>> {
+        let mut all: Vec<Arc<Workspace>> =
+            self.workspaces.lock().unwrap().values().cloned().collect();
+        all.sort_by(|a, b| (a.created_at_ms, a.id.as_str()).cmp(&(b.created_at_ms, b.id.as_str())));
+        all
     }
 
     /// Summaries of every live workspace, in creation order.
