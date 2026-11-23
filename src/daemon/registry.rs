@@ -10,11 +10,11 @@
 //! diffs) can subscribe without new plumbing.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,13 +26,42 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Compositor, CompositorEvent, CompositorHandle,
+    Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
     daemon::{
         process::{ProcessInfo, ProcessRegistry, SpawnSpec},
         protocol::{ErrorResponse, code},
     },
     handle::Reply,
 };
+
+/// How many recent compositor events each workspace retains for wait
+/// verbs' "already happened" checks (`wait_for_commit`).
+const RECENT_EVENT_CAP: usize = 512;
+
+/// If `event` records a surface commit newer than `after_seq` (a direct
+/// `SurfaceCommitted`, or a window map/update — both produced by commits),
+/// returns the commit's `seq`. When `window` is set, only commits
+/// attributed to that window match.
+pub(crate) fn commit_seq(
+    event: &CompositorEvent,
+    after_seq: Seq,
+    window: Option<WindowId>,
+) -> Option<Seq> {
+    match event {
+        CompositorEvent::SurfaceCommitted { seq, window_id, .. }
+            if *seq > after_seq && window.is_none_or(|w| *window_id == Some(w)) =>
+        {
+            Some(*seq)
+        }
+        CompositorEvent::WindowMapped { seq, window: w }
+        | CompositorEvent::WindowUpdated { seq, window: w }
+            if *seq > after_seq && window == Some(w.id) =>
+        {
+            Some(*seq)
+        }
+        _ => None,
+    }
+}
 
 /// Milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
@@ -114,11 +143,19 @@ pub struct Workspace {
     pump: Mutex<Option<JoinHandle<()>>>,
     /// Broadcast of every compositor event, for event-driven verbs.
     events: broadcast::Sender<CompositorEvent>,
+    /// Bounded ring of the most recent events, for `wait_for_commit`'s
+    /// "already happened" check. Shared with the event-pump thread.
+    recent: Arc<Mutex<VecDeque<CompositorEvent>>>,
     /// Managed children spawned by `spawn_app`, tracked until teardown.
     processes: ProcessRegistry,
     /// Highest sequence number observed (events and command replies).
     /// Shared with the event-pump thread.
     seq: Arc<AtomicU64>,
+    /// Wall-clock time of the last compositor event (not command) — the
+    /// baseline `wait_for_idle` measures its quiet window from.
+    last_event_ms: Arc<AtomicU64>,
+    /// Number of wait verbs currently blocked on this workspace.
+    active_waits: Arc<AtomicUsize>,
     last_active_ms: Arc<AtomicU64>,
     created_at_ms: u64,
     meta_path: PathBuf,
@@ -149,17 +186,28 @@ impl Workspace {
         let receiver = handle.subscribe().map_err(ErrorResponse::from)?;
         let (events, _) = broadcast::channel(256);
         let seq = Arc::new(AtomicU64::new(0));
+        let last_event_ms = Arc::new(AtomicU64::new(now_ms()));
         let last_active_ms = Arc::new(AtomicU64::new(now_ms()));
+        let recent = Arc::new(Mutex::new(VecDeque::new()));
         let pump = {
             let events = events.clone();
             let seq = seq.clone();
+            let last_event = last_event_ms.clone();
             let last_active = last_active_ms.clone();
+            let recent = recent.clone();
             std::thread::Builder::new()
                 .name(format!("scry-ws-events-{id}"))
                 .spawn(move || {
                     for event in receiver.iter() {
                         seq.fetch_max(event.seq(), Ordering::Relaxed);
+                        last_event.store(now_ms(), Ordering::Relaxed);
                         last_active.store(now_ms(), Ordering::Relaxed);
+                        let mut ring = recent.lock().unwrap_or_else(|e| e.into_inner());
+                        if ring.len() >= RECENT_EVENT_CAP {
+                            ring.pop_front();
+                        }
+                        ring.push_back(event.clone());
+                        drop(ring);
                         // No subscribers yet is fine — broadcast for verbs
                         // that need it (wait_*, get_changes_since).
                         let _ = events.send(event);
@@ -178,8 +226,11 @@ impl Workspace {
             compositor: Mutex::new(Some(compositor)),
             pump: Mutex::new(Some(pump)),
             events,
+            recent,
             processes: ProcessRegistry::new(),
             seq,
+            last_event_ms,
+            active_waits: Arc::new(AtomicUsize::new(0)),
             last_active_ms,
             created_at_ms: now_ms(),
         };
@@ -218,10 +269,41 @@ impl Workspace {
     /// Subscribe to the workspace's compositor event stream.
     ///
     /// Used by event-driven verbs (`wait_for_window`, `wait_for_commit`,
-    /// `wait_for_idle`, `get_changes_since`) added by later milestones.
-    #[allow(dead_code)]
+    /// `wait_for_idle`, `get_changes_since`).
     pub fn subscribe(&self) -> broadcast::Receiver<CompositorEvent> {
         self.events.subscribe()
+    }
+
+    /// Wall-clock time (epoch ms) of the last compositor event — events
+    /// only, unlike [`Self::touch`], which also counts commands.
+    pub fn last_event_ms(&self) -> u64 {
+        self.last_event_ms.load(Ordering::Relaxed)
+    }
+
+    /// The highest `seq` of a retained commit newer than `after_seq` (and
+    /// attributed to `window`, when set), or `None` when no matching
+    /// commit is still in the recent-event log.
+    pub fn recent_commit_seq(&self, after_seq: Seq, window: Option<WindowId>) -> Option<Seq> {
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|event| commit_seq(event, after_seq, window))
+            .max()
+    }
+
+    /// How many wait verbs are currently blocked on this workspace.
+    pub fn active_waits(&self) -> usize {
+        self.active_waits.load(Ordering::Relaxed)
+    }
+
+    /// Marks a wait verb as in-flight; the returned guard unmarks it on
+    /// drop, so cancellation and completion both release it.
+    pub fn track_wait(&self) -> WaitTracker {
+        self.active_waits.fetch_add(1, Ordering::Relaxed);
+        WaitTracker {
+            count: self.active_waits.clone(),
+        }
     }
 
     /// Whether the workspace currently holds a live compositor.
@@ -303,6 +385,7 @@ impl Workspace {
             "created_at_ms": self.created_at_ms,
             "last_active_ms": self.last_active_ms.load(Ordering::Relaxed),
             "processes": self.processes.snapshot(),
+            "active_waits": self.active_waits(),
         })
     }
 
@@ -364,6 +447,18 @@ impl Workspace {
         if let Err(err) = self.persist(Some(now_ms()), Some(reason)) {
             warn!(workspace = %self.id, "failed to persist close metadata: {err}");
         }
+    }
+}
+
+/// RAII marker for an in-flight wait verb; releases the workspace's
+/// `active_waits` slot on drop.
+pub struct WaitTracker {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for WaitTracker {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

@@ -21,10 +21,12 @@ fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
 pub const ADD: MethodDef = MethodDef {
     name: "output_add",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            add(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            add(ws, call.params).await
         })
     },
 };
@@ -33,9 +35,11 @@ pub const ADD: MethodDef = MethodDef {
 pub const LIST: MethodDef = MethodDef {
     name: "output_list",
     scope: Scope::Workspace { mutating: false },
-    run: |_ctx, _params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
             let reply = ws.call(|handle| handle.outputs()).await?;
             Ok(json!({
                 "outputs": reply.value,
@@ -50,10 +54,12 @@ pub const LIST: MethodDef = MethodDef {
 pub const REMOVE: MethodDef = MethodDef {
     name: "output_remove",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            remove(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            remove(ws, call.params).await
         })
     },
 };

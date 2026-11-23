@@ -7,5 +7,6 @@
 pub mod input;
 pub mod output;
 pub mod spawn;
+pub mod waits;
 pub mod windows;
 pub mod workspace;

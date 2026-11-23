@@ -32,10 +32,12 @@ fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
 pub const CLICK: MethodDef = MethodDef {
     name: "click",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            click(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            click(ws, call.params).await
         })
     },
 };
@@ -44,10 +46,12 @@ pub const CLICK: MethodDef = MethodDef {
 pub const DRAG: MethodDef = MethodDef {
     name: "drag",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            drag(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            drag(ws, call.params).await
         })
     },
 };
@@ -57,10 +61,12 @@ pub const DRAG: MethodDef = MethodDef {
 pub const TYPE_TEXT: MethodDef = MethodDef {
     name: "type_text",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            type_text(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            type_text(ws, call.params).await
         })
     },
 };
@@ -70,10 +76,12 @@ pub const TYPE_TEXT: MethodDef = MethodDef {
 pub const KEY_COMBO: MethodDef = MethodDef {
     name: "key_combo",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            key_combo(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            key_combo(ws, call.params).await
         })
     },
 };
@@ -82,10 +90,12 @@ pub const KEY_COMBO: MethodDef = MethodDef {
 pub const CLIPBOARD_GET: MethodDef = MethodDef {
     name: "clipboard_get",
     scope: Scope::Workspace { mutating: false },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            clipboard_get(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            clipboard_get(ws, call.params).await
         })
     },
 };
@@ -94,10 +104,12 @@ pub const CLIPBOARD_GET: MethodDef = MethodDef {
 pub const CLIPBOARD_SET: MethodDef = MethodDef {
     name: "clipboard_set",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            clipboard_set(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            clipboard_set(ws, call.params).await
         })
     },
 };

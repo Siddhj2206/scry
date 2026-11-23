@@ -78,9 +78,11 @@ impl CaptureFormat {
 pub const LIST_WINDOWS: MethodDef = MethodDef {
     name: "list_windows",
     scope: Scope::Workspace { mutating: false },
-    run: |_ctx, _params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
             let reply = ws
                 .call(|handle| {
                     let windows = handle.windows()?;
@@ -106,10 +108,12 @@ pub const LIST_WINDOWS: MethodDef = MethodDef {
 pub const PLACE_WINDOW: MethodDef = MethodDef {
     name: "place_window",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            place(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            place(ws, call.params).await
         })
     },
 };
@@ -119,10 +123,12 @@ pub const PLACE_WINDOW: MethodDef = MethodDef {
 pub const CAPTURE_WINDOW: MethodDef = MethodDef {
     name: "capture_window",
     scope: Scope::Workspace { mutating: false },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            capture_window(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            capture_window(ws, call.params).await
         })
     },
 };
@@ -132,10 +138,12 @@ pub const CAPTURE_WINDOW: MethodDef = MethodDef {
 pub const CAPTURE_WORKSPACE: MethodDef = MethodDef {
     name: "capture_workspace",
     scope: Scope::Workspace { mutating: false },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            capture_workspace(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            capture_workspace(ws, call.params).await
         })
     },
 };
@@ -145,10 +153,12 @@ pub const CAPTURE_WORKSPACE: MethodDef = MethodDef {
 pub const GET_DAMAGE: MethodDef = MethodDef {
     name: "get_damage",
     scope: Scope::Workspace { mutating: false },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            get_damage(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            get_damage(ws, call.params).await
         })
     },
 };

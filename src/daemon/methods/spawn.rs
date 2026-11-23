@@ -22,10 +22,12 @@ fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
 pub const SPAWN_APP: MethodDef = MethodDef {
     name: "spawn_app",
     scope: Scope::Workspace { mutating: true },
-    run: |_ctx, params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
-            spawn_app(ws, params).await
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
+            spawn_app(ws, call.params).await
         })
     },
 };

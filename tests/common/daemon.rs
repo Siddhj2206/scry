@@ -5,13 +5,44 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
+use scry::daemon::{DaemonConfig, DaemonHandle};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A live daemon bound to a fresh temporary runtime/state directory.
+pub struct TestDaemon {
+    pub handle: DaemonHandle,
+    _dir: TempDir,
+    pub socket_path: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+/// Spawns a daemon on an isolated control socket + state directory, with a
+/// fast reaper interval so idle-TTL tests stay quick.
+pub fn spawn_daemon() -> TestDaemon {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let socket_path = dir.path().join("run/scry.sock");
+    let state_dir = dir.path().join("state");
+    let config = DaemonConfig {
+        socket_path: socket_path.clone(),
+        state_dir: state_dir.clone(),
+        default_idle_ttl: Duration::from_secs(300),
+        reaper_interval: Duration::from_millis(25),
+    };
+    let handle = DaemonHandle::spawn(config).expect("daemon failed to start");
+    TestDaemon {
+        handle,
+        _dir: dir,
+        socket_path,
+        state_dir,
+    }
+}
 
 /// A blocking JSON-RPC 2.0 client bound to one daemon control-socket
 /// connection.
@@ -68,6 +99,36 @@ impl RpcClient {
             .read_line(&mut line)
             .expect("failed to read response");
         serde_json::from_str(&line).expect("response was not valid JSON")
+    }
+
+    /// Issues a request and returns the full response frame, whether it
+    /// carries `result` or `error` — for long-running verbs driven from a
+    /// dedicated thread where either outcome is asserted by the caller.
+    pub fn call_frame(&mut self, method: &str, params: Value) -> Value {
+        let id = self.alloc_id();
+        self.request_frame(id, method, params)
+    }
+
+    /// Writes a request without reading any response, returning the id used.
+    ///
+    /// For blocking verbs (waits): the caller observes the in-flight request
+    /// through other means (a second connection, `active_waits`) and can
+    /// drop the connection to test disconnect cancellation.
+    pub fn send_request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.alloc_id();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.writer
+            .write_all(request.to_string().as_bytes())
+            .expect("failed to write request");
+        self.writer
+            .write_all(b"\n")
+            .expect("failed to write newline");
+        id
     }
 
     /// Issues a request and returns the `result` object on success.
