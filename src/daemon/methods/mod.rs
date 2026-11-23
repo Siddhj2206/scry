@@ -4,5 +4,6 @@
 //! in [`crate::daemon::router::METHODS`]. New verb families (input, spawn,
 //! waits, diffs) get their own module here.
 
+pub mod input;
 pub mod output;
 pub mod workspace;
