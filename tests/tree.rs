@@ -849,9 +849,10 @@ fn get_tree_root_ref_drills_into_subtree() {
     // The scoped result is itself a snapshot whose refs resolve.
     assert!(scoped["snapshot_id"].as_u64().unwrap() > full["snapshot_id"].as_u64().unwrap());
 
-    // Unknown ref → STALE_REF with a re-snapshot hint.
+    // Unknown ref → INVALID_PARAMS with a re-snapshot hint (same
+    // contract as click_node/node_action).
     let err = rpc.call_err("get_tree", json!({"workspace": "drill", "root_ref": "e99"}));
-    assert_eq!(err.code, -32010, "expected STALE_REF, got {err:?}");
+    assert_eq!(err.code, -32602, "expected INVALID_PARAMS, got {err:?}");
     assert!(err.message.contains("e99"));
 
     // A ref requested before any snapshot exists fails the same way.
@@ -861,7 +862,7 @@ fn get_tree_root_ref_drills_into_subtree() {
         "get_tree",
         json!({"workspace": "drill-fresh", "root_ref": "e1"}),
     );
-    assert_eq!(err.code, -32010, "expected STALE_REF, got {err:?}");
+    assert_eq!(err.code, -32602, "expected INVALID_PARAMS, got {err:?}");
 }
 
 /// A `root_ref` whose node changed since its snapshot — the peer went

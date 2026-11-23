@@ -86,9 +86,10 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
         limits.deadline = Duration::from_millis(ms.max(1));
     }
 
-    // `root_ref` resolves against the requested snapshot (or the latest):
-    // unknown/evicted refs fail fast with `STALE_REF` and a re-snapshot
-    // hint — same contract M3.4's action verbs use.
+    // `root_ref` resolves against the requested snapshot (or the
+    // latest): unknown/evicted refs fail as param errors, a live
+    // identity drift fails with `STALE_REF` — the same contract
+    // `click_node`/`node_action` use.
     let subtree = match &root_ref {
         Some(node_ref) => Some(resolve_root_ref(&ws, node_ref, snapshot_id)?),
         None => None,
@@ -96,7 +97,7 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
 
     let reply = ws.call(|handle| handle.windows()).await?;
     let mut windows = reply.value;
-    if let Some(sub) = &subtree {
+    if let Some((snapshot, sub)) = &subtree {
         if let Some(id) = window_filter
             && id != sub.window_id
         {
@@ -106,9 +107,15 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
             )));
         }
         if !windows.iter().any(|w| w.id == sub.window_id) {
-            return Err(stale_ref(
+            // The window the ref fused into is gone — same staleness
+            // contract as `click_node`'s dead-window case.
+            return Err(stale_ref_error(
                 root_ref.as_deref().unwrap_or_default(),
-                "the window the ref was captured in is gone",
+                snapshot.id,
+                sub,
+                "missing",
+                "the window the ref was captured in no longer exists",
+                None,
             ));
         }
         windows.retain(|w| w.id == sub.window_id);
@@ -131,7 +138,12 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
         reason = cancel_reason(&call.cancel, &ws, &pids) => {
             return Err(cancelled(reason));
         }
-        capture = a11y::capture(ws.a11y_address(), &windows, &limits, subtree.as_ref()) => {
+        capture = a11y::capture(
+            ws.a11y_address(),
+            &windows,
+            &limits,
+            subtree.as_ref().map(|(_, sub)| sub),
+        ) => {
             capture.map_err(|err| match err {
                 a11y::CaptureError::Deadline => ErrorResponse::with_data(
                     code::TIMEOUT,
@@ -139,17 +151,24 @@ async fn get_tree(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorResponse
                     json!({"verb": "get_tree", "deadline_ms": limits.deadline.as_millis() as u64}),
                 ),
                 a11y::CaptureError::StaleRoot {
-                    expected_role,
-                    expected_name,
+                    mismatch,
                     actual,
                 } => {
-                    let reason = match &actual {
-                        Some((role, name)) => format!(
-                            "the node changed (was {expected_role:?} {expected_name:?}, now {role:?} {name:?})"
-                        ),
-                        None => "the node is gone".to_string(),
-                    };
-                    stale_ref(root_ref.as_deref().unwrap_or_default(), &reason)
+                    let (snapshot, sub) = subtree.as_ref().expect("stale root implies a subtree");
+                    stale_ref_error(
+                        root_ref.as_deref().unwrap_or_default(),
+                        snapshot.id,
+                        sub,
+                        mismatch,
+                        &match &actual {
+                            Some((role, name)) => format!(
+                                "its identity changed (was {:?} {:?}, now {role:?} {name:?})",
+                                sub.role, sub.name,
+                            ),
+                            None => "the node no longer exists".to_string(),
+                        },
+                        actual,
+                    )
                 }
             })?
         }
@@ -190,51 +209,81 @@ fn bounded_param(params: &Value, name: &str) -> Result<Option<usize>, ErrorRespo
 
 /// Resolves a `root_ref` (`eN`) to its staleness identity via the
 /// requested snapshot (or the workspace's latest). Unknown refs and
-/// evicted snapshots fail with `STALE_REF` plus a re-snapshot hint.
+/// unknown/evicted snapshots are param errors — matching `click_node`/
+/// `node_action`'s `resolve_ref` contract.
 fn resolve_root_ref(
     ws: &Workspace,
     node_ref: &str,
     snapshot_id: Option<u64>,
-) -> Result<SubtreeRoot, ErrorResponse> {
+) -> Result<(a11y::TreeSnapshot, SubtreeRoot), ErrorResponse> {
     let snapshot = match snapshot_id {
         Some(id) => ws.tree_snapshot(id).ok_or_else(|| {
-            stale_ref(
-                node_ref,
-                &format!(
-                    "snapshot {id} is not retained (the workspace keeps the last {}): take a fresh get_tree snapshot",
-                    a11y::SNAPSHOT_HISTORY
-                ),
+            ErrorResponse::invalid_params_data(
+                format!("snapshot {id} is unknown or has been evicted"),
+                json!({
+                    "snapshot": id,
+                    "hint": "run get_tree to capture a fresh snapshot",
+                }),
             )
         })?,
         None => ws.latest_tree_snapshot().ok_or_else(|| {
-            stale_ref(
-                node_ref,
-                "no get_tree snapshot exists yet: take one first",
-            )
+            ErrorResponse::invalid_params(format!(
+                "root_ref {node_ref:?} cannot be resolved: no get_tree snapshot exists yet; \
+                 run get_tree first"
+            ))
         })?,
     };
     let target = snapshot.lookup_ref(node_ref).ok_or_else(|| {
-        stale_ref(
-            node_ref,
-            &format!("no ref {node_ref:?} in snapshot {}", snapshot.id),
+        ErrorResponse::invalid_params_data(
+            format!(
+                "root_ref {node_ref:?} does not exist in snapshot {}",
+                snapshot.id
+            ),
+            json!({
+                "ref": node_ref,
+                "snapshot_id": snapshot.id,
+                "hint": "run get_tree for fresh refs",
+            }),
         )
     })?;
-    Ok(SubtreeRoot {
-        window_id: target.window_id,
-        bus_name: target.bus_name,
-        object_path: target.object_path,
-        role: target.role,
-        name: target.name,
-        anchor: target.bounds,
-    })
+    Ok((
+        snapshot,
+        SubtreeRoot {
+            window_id: target.window_id,
+            bus_name: target.bus_name,
+            object_path: target.object_path,
+            role: target.role,
+            name: target.name,
+            anchor: target.bounds,
+        },
+    ))
 }
 
-/// A `STALE_REF` error: unusable ref, with a re-snapshot hint.
-fn stale_ref(node_ref: &str, reason: &str) -> ErrorResponse {
+/// The structured `STALE_REF` failure for a drifted subtree root — same
+/// shape `click_node`/`node_action` report through `stale_error`.
+fn stale_ref_error(
+    node_ref: &str,
+    snapshot_id: u64,
+    sub: &SubtreeRoot,
+    mismatch: &'static str,
+    drift: &str,
+    actual: Option<(String, String)>,
+) -> ErrorResponse {
     ErrorResponse::with_data(
         code::STALE_REF,
-        format!("tree ref {node_ref:?} is stale: {reason}; call get_tree to take a fresh snapshot"),
-        json!({"ref": node_ref, "reason": reason, "hint": "call get_tree to take a fresh snapshot"}),
+        format!(
+            "ref {node_ref:?} is stale: {drift}; run get_tree to re-snapshot and use a fresh ref"
+        ),
+        json!({
+            "ref": node_ref,
+            "snapshot_id": snapshot_id,
+            "mismatch": mismatch,
+            "bus_name": sub.bus_name,
+            "path": sub.object_path,
+            "expected": {"role": sub.role, "name": sub.name},
+            "actual": actual.map(|(role, name)| json!({"role": role, "name": name})),
+            "hint": "run get_tree to re-snapshot and use fresh refs",
+        }),
     )
 }
 

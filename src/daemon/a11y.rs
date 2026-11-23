@@ -428,10 +428,8 @@ pub enum CaptureError {
     /// The `root_ref` node is gone or its `(role, exact name)` identity
     /// changed since the snapshot it came from. Maps to `STALE_REF`.
     StaleRoot {
-        /// The role name the snapshot recorded.
-        expected_role: String,
-        /// The exact name the snapshot recorded.
-        expected_name: String,
+        /// What `verify_ref` reported: `"missing"`, `"role"` or `"name"`.
+        mismatch: &'static str,
         /// The live `(role, name)` — `None` when the object stopped
         /// answering entirely.
         actual: Option<(String, String)>,
@@ -931,8 +929,9 @@ async fn accessible_at<'a>(
 /// One `root_ref`-scoped capture: re-verify the subtree root's staleness
 /// identity live, then walk just that subtree under the same bounds.
 ///
-/// Registry enumeration is skipped (the ref already pins
-/// `bus_name`/`path`); the bus report still reflects connectivity.
+/// Registry enumeration is skipped for correlation (the ref already pins
+/// `bus_name`/`path`); a best-effort registry listing still feeds the bus
+/// report's `registered_apps` count.
 async fn subtree_capture(
     conn: &zbus::Connection,
     dbus: &DBusProxy<'_>,
@@ -941,9 +940,24 @@ async fn subtree_capture(
     budget: &mut Budget,
 ) -> Result<Capture, CaptureError> {
     let stale = |actual: Option<(String, String)>| CaptureError::StaleRoot {
-        expected_role: subtree.role.clone(),
-        expected_name: subtree.name.clone(),
+        mismatch: "missing",
         actual,
+    };
+
+    // Best-effort report: a dead registry does not block a subtree
+    // capture (the ref needs no discovery), but the report stays honest.
+    let bus = match accessible_at(conn, REGISTRY_NAME, REGISTRY_ROOT).await {
+        Ok(registry) => match registry.get_children().await {
+            Ok(roots) => BusReport::Connected {
+                registered_apps: roots.iter().filter(|r| !r.is_null()).count(),
+            },
+            Err(err) => BusReport::Error {
+                message: format!("failed to enumerate registered applications: {err}"),
+            },
+        },
+        Err(err) => BusReport::Error {
+            message: format!("failed to reach the AT-SPI2 registry: {err}"),
+        },
     };
 
     let Some(window) = windows.iter().find(|w| w.id == subtree.window_id) else {
@@ -965,7 +979,10 @@ async fn subtree_capture(
         },
     )
     .await
-    .map_err(|err| stale(err.actual_role.zip(err.actual_name)))?;
+    .map_err(|err| CaptureError::StaleRoot {
+        mismatch: err.mismatch,
+        actual: err.actual_role.zip(err.actual_name),
+    })?;
 
     // Resolve the ref's `(bus_name, object_path)` to an ObjectRef for the
     // walk itself.
@@ -1022,7 +1039,7 @@ async fn subtree_capture(
         }
     }
     Ok(Capture {
-        bus: BusReport::Connected { registered_apps: 0 },
+        bus,
         windows: vec![entry],
         truncation: budget.summary(),
     })
