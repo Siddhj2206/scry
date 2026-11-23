@@ -30,8 +30,11 @@ use crate::{
     Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
     compositor::{JoinOutcome, join_bounded},
     daemon::{
+        a11y,
+        bus::BusManager,
         changelog::{ChangeLog, Mark},
         now_ms,
+        portal::PortalManager,
         process::{ProcessInfo, ProcessRegistry, SpawnSpec},
         protocol::{ErrorResponse, code},
     },
@@ -155,6 +158,16 @@ pub struct Workspace {
     recent: Arc<Mutex<VecDeque<CompositorEvent>>>,
     /// Managed children spawned by `spawn_app`, tracked until teardown.
     processes: ProcessRegistry,
+    /// The workspace's private D-Bus session bus, AT-SPI2 bus and
+    /// `at-spi2-registryd` — launched at creation, torn down with it.
+    buses: BusManager,
+    /// Bounded ring of `get_tree` snapshots — the state behind M3.4's
+    /// staleness-checked refs and M3.5's `tree_diff`/`tree_find`.
+    tree_snapshots: Mutex<a11y::SnapshotStore>,
+    /// The scripted XDG Desktop Portal stub on the session bus —
+    /// `org.freedesktop.portal.Desktop`, plus the control verbs'
+    /// scripting/history state.
+    portal: PortalManager,
     /// Bounded seq-indexed event log plus named marks — the state behind
     /// `get_changes_since`, `mark_set` and `mark_list`. Shared with the
     /// event-pump thread.
@@ -236,11 +249,30 @@ impl Workspace {
                 })?
         };
 
+        // The private buses launch alongside the compositor, binding
+        // sockets inside the same runtime dir. Blocking-friendly: socket
+        // binds, process spawns and a bounded readiness wait.
+        let buses = {
+            let runtime_dir = handle.runtime_dir().to_owned();
+            tokio::task::spawn_blocking(move || BusManager::start(runtime_dir))
+                .await
+                .map_err(|err| {
+                    ErrorResponse::new(code::INTERNAL, format!("bus task failed: {err}"))
+                })?
+        };
+
+        // With the session bus up, serve the scripted XDG Desktop
+        // Portal stub on it; a missing bus or failed claim degrades
+        // into the portal report, never the workspace.
+        let portal = PortalManager::start(&buses).await;
+
         let workspace = Self {
             meta_path: state_dir.join("workspaces").join(format!("{id}.json")),
             id,
             options,
             handle,
+            buses,
+            portal,
             compositor: Mutex::new(Some(compositor)),
             pump: Mutex::new(Some(pump)),
             closing: CancellationToken::new(),
@@ -248,6 +280,7 @@ impl Workspace {
             events,
             recent,
             processes: ProcessRegistry::new(),
+            tree_snapshots: Mutex::new(a11y::SnapshotStore::default()),
             change_log,
             seq,
             last_event_ms,
@@ -361,9 +394,12 @@ impl Workspace {
         if self.closing.is_cancelled() {
             return Err(closing());
         }
-        let info =
-            self.processes
-                .spawn(spec, self.handle.runtime_dir(), self.handle.socket_name())?;
+        let info = self.processes.spawn(
+            spec,
+            self.handle.runtime_dir(),
+            self.handle.socket_name(),
+            &self.buses.spawn_env(),
+        )?;
         if self.closing.is_cancelled() {
             // Teardown raced the spawn: make sure nothing escapes.
             self.processes.terminate_all();
@@ -379,6 +415,54 @@ impl Workspace {
     /// process detail behind `workspace_list` and `status`.
     pub fn process_snapshot(&self) -> Vec<ProcessInfo> {
         self.processes.snapshot()
+    }
+
+    /// Per-endpoint health of the workspace's private session D-Bus and
+    /// AT-SPI2 buses — the `bus` section of `workspace_list` and `status`.
+    pub fn bus_report(&self) -> Value {
+        self.buses.report()
+    }
+
+    /// The workspace's live AT-SPI2 bus address, when its a11y bus is
+    /// running — the address `get_tree` connects through.
+    pub fn a11y_address(&self) -> Option<String> {
+        self.buses.a11y_address()
+    }
+
+    /// Records `windows` as the workspace's next `get_tree` snapshot and
+    /// returns it with its assigned `snapshot_id`.
+    pub fn record_tree_snapshot(&self, windows: Vec<a11y::FusedWindow>) -> a11y::TreeSnapshot {
+        self.tree_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(windows)
+    }
+
+    /// A retained `get_tree` snapshot by id — M3.4's staleness checks and
+    /// M3.5's `tree_diff` resolve prior snapshots through this.
+    pub fn tree_snapshot(&self, id: u64) -> Option<a11y::TreeSnapshot> {
+        self.tree_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    /// The newest retained `get_tree` snapshot — where `get_tree`'s
+    /// `root_ref`, `click_node` and `node_action` resolve refs when the
+    /// caller names no `snapshot`.
+    pub fn latest_tree_snapshot(&self) -> Option<a11y::TreeSnapshot> {
+        self.tree_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .latest()
+            .cloned()
+    }
+
+    /// The workspace's scripted portal stub — scripting queue, invocation
+    /// history and health (`portal_*` verbs, `status`).
+    pub fn portal(&self) -> &PortalManager {
+        &self.portal
     }
 
     /// Attaches a named mark to the workspace's seq timeline (`mark_set`).
@@ -456,6 +540,8 @@ impl Workspace {
             "last_active_ms": self.last_active_ms.load(Ordering::Relaxed),
             "processes": self.processes.snapshot(),
             "active_waits": self.active_waits(),
+            "bus": self.buses.report(),
+            "portal": self.portal.report(),
         })
     }
 
@@ -508,8 +594,11 @@ impl Workspace {
         self.closing.cancel();
         // Children die first (SIGTERM, then bounded SIGKILL) while their
         // Wayland connection still works, so well-behaved apps can exit
-        // cleanly.
+        // cleanly. The private bus daemons go down right after — before
+        // the compositor's runtime dir (and their sockets) are removed.
         self.processes.terminate_all();
+        self.portal.stop();
+        self.buses.terminate_all();
         let compositor = self
             .compositor
             .lock()

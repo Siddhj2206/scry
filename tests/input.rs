@@ -106,6 +106,39 @@ fn pointer_motion_button_scroll_in_output_coordinates() {
     assert_eq!(client.state.pointer_axis[0], (0, -15.0));
 }
 
+/// Regression (real GTK4, M3.7): every pointer event batch must close
+/// with `wl_pointer.frame`. Wayland clients group pointer events by
+/// frame — GTK defers dispatch until a frame closes the batch, so a
+/// press emitted before the frame that carries `enter` landed against
+/// stale state and real GTK4 swallowed the first synthetic click.
+#[test]
+fn pointer_frame_closes_motion_and_button_batches() {
+    let compositor = Compositor::spawn().unwrap();
+    let handle = compositor.handle().clone();
+    let events = handle.subscribe().unwrap();
+
+    let mut client = TestClient::connect(handle.socket_path());
+    let _toplevel = client.map_toplevel(100, 100, "org.scry.Frame", "Frame");
+    wait_for_event(&events, |e| {
+        matches!(e, CompositorEvent::WindowMapped { .. })
+    });
+
+    // One motion batch: enter (or motion) + a closing frame.
+    handle
+        .move_pointer(PointerTarget::Output, 30.0, 40.0)
+        .unwrap();
+    client.pump_until(|s| s.pointer_frames >= 1);
+
+    // Button events frame too: press + release = two more frames.
+    handle
+        .press_pointer_button(scry::input::PointerButton::Left)
+        .unwrap();
+    handle
+        .release_pointer_button(scry::input::PointerButton::Left)
+        .unwrap();
+    client.pump_until(|s| s.pointer_frames >= 3 && s.pointer_buttons.len() == 2);
+}
+
 #[test]
 fn pointer_motion_in_window_local_coordinates() {
     let compositor = Compositor::spawn().unwrap();

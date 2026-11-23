@@ -105,11 +105,27 @@ enum Commands {
     /// Block on event-driven workspace conditions.
     #[command(subcommand)]
     Wait(WaitCommands),
+    /// Fused compositor + AT-SPI2 accessibility tree snapshot.
+    Tree(TreeArgs),
+    /// Search the fused accessibility tree by role/name/text/state.
+    TreeFind(TreeFindArgs),
+    /// Diff a prior tree snapshot against the live accessibility tree.
+    TreeDiff(TreeDiffArgs),
+    /// Click a fused accessibility node by its `eN` ref.
+    ClickNode(ClickNodeArgs),
+    /// Invoke an AT-SPI2 action on a fused node by its `eN` ref.
+    NodeAction(NodeActionArgs),
     /// Compact structured diff of everything that changed since a seq.
     Changes(ChangesArgs),
     /// Named marks on a workspace's seq timeline.
     #[command(subcommand)]
     Mark(MarkCommands),
+    /// Queue a scripted response for the workspace portal stub.
+    PortalSet(PortalSetArgs),
+    /// Drop queued portal scripts (all, or one interface's).
+    PortalClear(PortalClearArgs),
+    /// List recorded portal invocations.
+    PortalHistory(PortalHistoryArgs),
     /// Diagnostic status of the daemon and its workspaces.
     Status(StatusArgs),
 }
@@ -495,6 +511,132 @@ struct WaitIdleArgs {
 }
 
 #[derive(Args)]
+struct TreeArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Restrict the snapshot to one window id.
+    #[arg(long)]
+    window: Option<u64>,
+    /// Restrict the snapshot to one previously snapshotted node ref
+    /// (e.g. "e12") — drills into a subtree.
+    #[arg(long, value_name = "REF")]
+    root_ref: Option<String>,
+    /// Maximum descent depth (default 64); cut branches get an inline
+    /// `- ... depth limit reached` note.
+    #[arg(long, value_name = "N")]
+    max_depth: Option<u64>,
+    /// Maximum nodes emitted (default 10000); cut branches get an inline
+    /// `- ... node limit reached` note.
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<u64>,
+    /// Bound the a11y capture in milliseconds; open branches degrade
+    /// into `- ... deadline exceeded` notes.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct TreeFindArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Restrict the search to one window id.
+    #[arg(long)]
+    window: Option<u64>,
+    /// Match the node's accessible role name exactly.
+    #[arg(long, value_name = "ROLE")]
+    role: Option<String>,
+    /// Match the node's accessible name.
+    #[arg(long, value_name = "TEXT")]
+    name: Option<String>,
+    /// Match the node's Text/Value contents.
+    #[arg(long, value_name = "TEXT")]
+    text: Option<String>,
+    /// "substring" (default) or "exact" name/text matching.
+    #[arg(long, value_parser = ["substring", "exact"])]
+    r#match: Option<String>,
+    /// Require this AT-SPI state on the node (repeatable).
+    #[arg(long, value_name = "STATE")]
+    state: Vec<String>,
+    /// Canonical context lines before/after each match (default 2).
+    #[arg(long, value_name = "N")]
+    context: Option<u64>,
+    /// Maximum descent depth (default 64).
+    #[arg(long, value_name = "N")]
+    max_depth: Option<u64>,
+    /// Maximum nodes emitted (default 10000).
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<u64>,
+    /// Bound the a11y capture in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct TreeDiffArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// The baseline snapshot id (default: the workspace's latest
+    /// snapshot).
+    #[arg(long, value_name = "ID")]
+    from: Option<u64>,
+    /// Maximum descent depth (default 64).
+    #[arg(long, value_name = "N")]
+    max_depth: Option<u64>,
+    /// Maximum nodes emitted (default 10000).
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<u64>,
+    /// Bound the a11y capture in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct ClickNodeArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// The node's `eN` ref from `scry tree`.
+    #[arg(long = "ref", value_name = "REF")]
+    node_ref: String,
+    /// The snapshot the ref belongs to (default: the latest).
+    #[arg(long, value_name = "ID")]
+    snapshot: Option<u64>,
+    /// Button name (left/right/middle/side/extra/forward/back/task) or a
+    /// raw evdev button code (default left).
+    #[arg(long)]
+    button: Option<String>,
+    /// Press/release repetitions (1–64, default 1).
+    #[arg(long)]
+    count: Option<u32>,
+    /// Bound the a11y verification in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct NodeActionArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// The node's `eN` ref from `scry tree`.
+    #[arg(long = "ref", value_name = "REF")]
+    node_ref: String,
+    /// The snapshot the ref belongs to (default: the latest).
+    #[arg(long, value_name = "ID")]
+    snapshot: Option<u64>,
+    /// The action name (e.g. "click", "press", "toggle"); default: the
+    /// node's primary action.
+    #[arg(long)]
+    action: Option<String>,
+    /// Bound the a11y verification + invocation in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Args)]
 struct ChangesArgs {
     /// The workspace id.
     #[arg(short, long, value_name = "ID")]
@@ -513,6 +655,43 @@ struct MarkSetArgs {
     /// Arbitrary JSON metadata echoed back by diffs and mark list.
     #[arg(long, value_parser = parse_json)]
     metadata: Option<Value>,
+}
+
+#[derive(Args)]
+struct PortalSetArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Portal interface to script: "filechooser" or "openuri".
+    #[arg(long)]
+    interface: String,
+    /// The scripted response: "accept" (default), "cancel", "close",
+    /// or a raw code 0-2.
+    #[arg(long, value_name = "RESPONSE")]
+    response: Option<String>,
+    /// A file:// URI to return on accept (repeatable).
+    #[arg(long = "uri", value_name = "URI")]
+    uris: Vec<String>,
+}
+
+#[derive(Args)]
+struct PortalClearArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Only clear this interface's queue (default: all interfaces).
+    #[arg(long)]
+    interface: Option<String>,
+}
+
+#[derive(Args)]
+struct PortalHistoryArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Only return the newest N invocations.
+    #[arg(long, value_name = "N")]
+    limit: Option<u64>,
 }
 
 #[derive(Args)]
@@ -907,6 +1086,106 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
             }
             (Verb::WaitForIdle, params, Outcome::Default)
         }
+        C::Tree(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(window) = args.window {
+                params["window_id"] = json!(window);
+            }
+            if let Some(root_ref) = &args.root_ref {
+                params["root_ref"] = json!(root_ref);
+            }
+            if let Some(depth) = args.max_depth {
+                params["max_depth"] = json!(depth);
+            }
+            if let Some(nodes) = args.max_nodes {
+                params["max_nodes"] = json!(nodes);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::GetTree, params, Outcome::Default)
+        }
+        C::TreeFind(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(window) = args.window {
+                params["window_id"] = json!(window);
+            }
+            if let Some(role) = &args.role {
+                params["role"] = json!(role);
+            }
+            if let Some(name) = &args.name {
+                params["name"] = json!(name);
+            }
+            if let Some(text) = &args.text {
+                params["text"] = json!(text);
+            }
+            if let Some(r#match) = &args.r#match {
+                params["match"] = json!(r#match);
+            }
+            if !args.state.is_empty() {
+                params["state"] = json!(args.state);
+            }
+            if let Some(context) = args.context {
+                params["context"] = json!(context);
+            }
+            if let Some(depth) = args.max_depth {
+                params["max_depth"] = json!(depth);
+            }
+            if let Some(nodes) = args.max_nodes {
+                params["max_nodes"] = json!(nodes);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::TreeFind, params, Outcome::Default)
+        }
+        C::TreeDiff(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(from) = args.from {
+                params["from_snapshot"] = json!(from);
+            }
+            if let Some(depth) = args.max_depth {
+                params["max_depth"] = json!(depth);
+            }
+            if let Some(nodes) = args.max_nodes {
+                params["max_nodes"] = json!(nodes);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::TreeDiff, params, Outcome::Default)
+        }
+        C::ClickNode(args) => {
+            let mut params = ws(&args.workspace);
+            params["ref"] = json!(args.node_ref);
+            if let Some(snapshot) = args.snapshot {
+                params["snapshot"] = json!(snapshot);
+            }
+            if let Some(button) = &args.button {
+                params["button"] = button_param(button);
+            }
+            if let Some(count) = args.count {
+                params["count"] = json!(count);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::ClickNode, params, Outcome::Default)
+        }
+        C::NodeAction(args) => {
+            let mut params = ws(&args.workspace);
+            params["ref"] = json!(args.node_ref);
+            if let Some(snapshot) = args.snapshot {
+                params["snapshot"] = json!(snapshot);
+            }
+            if let Some(action) = &args.action {
+                params["action"] = json!(action);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::NodeAction, params, Outcome::Default)
+        }
         C::Changes(args) => (
             Verb::GetChangesSince,
             json!({"workspace": args.workspace, "seq": args.seq}),
@@ -922,6 +1201,36 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
         }
         C::Mark(MarkCommands::List(args)) => {
             (Verb::MarkList, ws(&args.workspace), Outcome::Default)
+        }
+        C::PortalSet(args) => {
+            let mut params = ws(&args.workspace);
+            params["interface"] = json!(args.interface);
+            if let Some(response) = &args.response {
+                // A bare number goes out as the raw code; names pass
+                // through for the daemon to resolve.
+                params["response"] = match response.parse::<u32>() {
+                    Ok(code) => json!(code),
+                    Err(_) => json!(response),
+                };
+            }
+            if !args.uris.is_empty() {
+                params["uris"] = json!(args.uris);
+            }
+            (Verb::PortalScriptSet, params, Outcome::Default)
+        }
+        C::PortalClear(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(interface) = &args.interface {
+                params["interface"] = json!(interface);
+            }
+            (Verb::PortalScriptClear, params, Outcome::Default)
+        }
+        C::PortalHistory(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(limit) = args.limit {
+                params["limit"] = json!(limit);
+            }
+            (Verb::PortalHistory, params, Outcome::Default)
         }
         C::Status(args) => {
             let params = match &args.workspace {

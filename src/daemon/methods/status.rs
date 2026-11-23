@@ -135,6 +135,64 @@ async fn workspace_entry(
         ));
     }
 
+    // Private bus health: apps spawned into the workspace depend on the
+    // session D-Bus and the AT-SPI2 accessibility bus, so a down bus is
+    // always an actionable finding.
+    let bus = &entry["bus"];
+    for (key, label) in [("session", "session D-Bus"), ("at_spi", "AT-SPI2 bus")] {
+        match bus[key]["state"].as_str() {
+            Some("running") => {}
+            Some("degraded") => {
+                healthy = false;
+                unhealthy.push(format!(
+                    "workspace {id:?}: private {label} is degraded \
+                     (process exited or socket missing)"
+                ));
+                next_steps.push(format!(
+                    "close workspace {id:?} and recreate it to restart its private {label}"
+                ));
+            }
+            _ => {
+                healthy = false;
+                let reason = bus[key]["error"]
+                    .as_str()
+                    .unwrap_or("the bus was never launched");
+                unhealthy.push(format!(
+                    "workspace {id:?}: private {label} is stopped ({reason})"
+                ));
+                if key == "session" {
+                    next_steps.push(format!(
+                        "install a D-Bus broker (the dbus or dbus-broker package) and recreate \
+                         workspace {id:?}"
+                    ));
+                } else {
+                    next_steps.push(format!(
+                        "install at-spi2-core / a D-Bus broker and recreate workspace {id:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Portal stub health: with the session bus up but no portal serving,
+    // apps triggering file dialogs or URI launches hit ServiceUnknown.
+    // (A down session bus already reports itself above.)
+    let portal = &entry["portal"];
+    if portal["state"].as_str() != Some("running")
+        && bus["session"]["state"].as_str() == Some("running")
+    {
+        healthy = false;
+        let reason = portal["error"]
+            .as_str()
+            .unwrap_or("the portal stub is not serving");
+        unhealthy.push(format!(
+            "workspace {id:?}: XDG portal stub is not running ({reason})"
+        ));
+        next_steps.push(format!(
+            "close workspace {id:?} and recreate it to restart its portal stub"
+        ));
+    }
+
     // One compositor round-trip both proves responsiveness and yields the
     // output/window snapshot.
     let mut window_count = 0;

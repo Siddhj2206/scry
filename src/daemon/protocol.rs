@@ -50,6 +50,15 @@ pub mod code {
     pub const COMPOSITOR: i64 = -32008;
     /// Spawning or managing a workspace process failed.
     pub const PROCESS: i64 = -32009;
+    /// A `get_tree` ref no longer resolves: the node is gone, its role or
+    /// exact name changed, or the snapshot it came from was evicted. The
+    /// caller must take a fresh `get_tree` snapshot.
+    pub const STALE_REF: i64 = -32010;
+    /// A `tree_diff` baseline (`from_snapshot`) is unknown to the
+    /// workspace or has been evicted from its bounded snapshot history —
+    /// or no baseline exists yet. The caller must capture a fresh
+    /// `get_tree` snapshot to diff against.
+    pub const SNAPSHOT_EVICTED: i64 = -32011;
 }
 
 /// A decoded JSON-RPC request.

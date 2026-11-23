@@ -21,9 +21,21 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::daemon::{
+    bus::BusEnv,
     now_ms,
     protocol::{ErrorResponse, code},
 };
+
+/// Inherited host-bus variables scrubbed from every spawned child's
+/// environment. The workspace's private addresses are injected in their
+/// place (when the buses are up); caller overrides still win.
+const SCRUBBED_BUS_ENV: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DBUS_SYSTEM_BUS_ADDRESS",
+    "DBUS_STARTER_ADDRESS",
+    "DBUS_STARTER_BUS_TYPE",
+    "AT_SPI_BUS_ADDRESS",
+];
 
 /// Grace period between SIGTERM and SIGKILL during teardown.
 const TERM_GRACE: Duration = Duration::from_secs(2);
@@ -131,6 +143,7 @@ impl ProcessRegistry {
         spec: &SpawnSpec,
         runtime_dir: &Path,
         wayland_display: &OsStr,
+        bus_env: &BusEnv,
     ) -> Result<ProcessInfo, ErrorResponse> {
         let mut command = Command::new(&spec.program);
         command
@@ -143,6 +156,18 @@ impl ProcessRegistry {
             .env("XDG_RUNTIME_DIR", runtime_dir)
             .env("WAYLAND_DISPLAY", wayland_display)
             .env_remove("DISPLAY");
+        // Scrub inherited host bus wiring first, then inject the
+        // workspace's private buses. When a bus is down, children get no
+        // address for it at all — never the host's.
+        for key in SCRUBBED_BUS_ENV {
+            command.env_remove(key);
+        }
+        if let Some(address) = &bus_env.session_address {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
+        if let Some(address) = &bus_env.a11y_address {
+            command.env("AT_SPI_BUS_ADDRESS", address);
+        }
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
@@ -319,7 +344,7 @@ impl ProcessRegistry {
 /// fallback for a child that re-grouped itself. Errors (ESRCH on an
 /// already-gone group) are expected and ignored.
 #[cfg(unix)]
-fn signal_tree(pid: u32, signal: i32) {
+pub(crate) fn signal_tree(pid: u32, signal: i32) {
     let pid = pid as i32;
     // SAFETY: kill() takes a pid and signal; no memory is touched.
     unsafe {

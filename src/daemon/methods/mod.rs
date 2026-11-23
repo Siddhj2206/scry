@@ -6,9 +6,13 @@
 
 pub mod changes;
 pub mod input;
+pub mod node;
+pub mod observe;
 pub mod output;
+pub mod portal;
 pub mod spawn;
 pub mod status;
+pub mod tree;
 pub mod waits;
 pub mod windows;
 pub mod workspace;

@@ -152,7 +152,7 @@ impl TargetPoint {
 /// Resolves a `button` parameter: a friendly name (`"left"`, `"right"`,
 /// `"middle"`, `"side"`, `"extra"`, `"forward"`, `"back"`, `"task"`) or a
 /// raw evdev button code (0x100–0x2FF). Defaults to `left`.
-fn button_param(value: Option<&Value>) -> Result<PointerButton, ErrorResponse> {
+pub(crate) fn button_param(value: Option<&Value>) -> Result<PointerButton, ErrorResponse> {
     match value {
         None | Some(Value::Null) => Ok(PointerButton::Left),
         Some(Value::String(name)) => named_button(name).ok_or_else(|| {
@@ -196,7 +196,7 @@ fn named_button(name: &str) -> Option<PointerButton> {
 
 /// A display label for a resolved button (names for known buttons, the raw
 /// code for [`PointerButton::Other`]).
-fn button_label(button: PointerButton) -> Value {
+pub(crate) fn button_label(button: PointerButton) -> Value {
     match button {
         PointerButton::Left => json!("left"),
         PointerButton::Right => json!("right"),

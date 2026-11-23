@@ -20,8 +20,12 @@
 //!                                       └───────────────────────────────┘
 //! ```
 
+pub mod a11y;
+pub mod bus;
+pub mod canon;
 mod changelog;
 pub mod methods;
+pub mod portal;
 pub mod process;
 pub mod protocol;
 pub mod registry;
@@ -69,6 +73,48 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// How often an in-flight blocking verb re-checks `client_pid` liveness.
+pub(crate) const LIVENESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Whether `pid` still refers to a live, non-zombie process.
+///
+/// Reads `/proc` directly: a missing entry means the process is gone; a
+/// `Z`/`X` state means it exited and awaits (or completed) reaping.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state letter follows the last ')' (comm can contain spaces).
+    match stat
+        .rsplit(')')
+        .next()
+        .and_then(|tail| tail.split_whitespace().next())
+    {
+        Some(state) => !matches!(state, "Z" | "X" | "x"),
+        None => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn pid_alive(_pid: u32) -> bool {
+    // Process-liveness probing is only implemented on Linux; elsewhere the
+    // check is a no-op so disconnect cancellation still applies.
+    true
+}
+
+/// Pids whose death cancels an in-flight verb: the explicit `client_pid`
+/// param plus the socket peer's `SO_PEERCRED` pid, deduplicated.
+pub(crate) fn watched_pids(client_pid: Option<u32>, peer_pid: Option<u32>) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    for pid in [client_pid, peer_pid].into_iter().flatten() {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 /// Daemon configuration.

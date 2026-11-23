@@ -504,11 +504,22 @@ fn idle_reaper_closes_only_expired_workspaces() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(daemon.state_dir.join("workspaces/ephemeral.json"))
-            .expect("reaped workspace metadata missing"),
-    )
-    .unwrap();
-    assert_eq!(meta["state"], "closed");
+    // `workspace_list` drops the entry as soon as teardown starts; the
+    // "closed" metadata lands when teardown finishes persisting it.
+    let meta_path = daemon.state_dir.join("workspaces/ephemeral.json");
+    let meta: Value = loop {
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path).expect("reaped workspace metadata missing"),
+        )
+        .unwrap();
+        if meta["state"] == "closed" {
+            break meta;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace teardown never persisted closed metadata: {meta}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(meta["close_reason"], "idle_ttl");
 }

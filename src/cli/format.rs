@@ -53,12 +53,28 @@ pub enum Verb {
     WaitForCommit,
     /// `wait_for_idle`.
     WaitForIdle,
+    /// `get_tree`.
+    GetTree,
+    /// `tree_find`.
+    TreeFind,
+    /// `tree_diff`.
+    TreeDiff,
+    /// `click_node`.
+    ClickNode,
+    /// `node_action`.
+    NodeAction,
     /// `get_changes_since`.
     GetChangesSince,
     /// `mark_set`.
     MarkSet,
     /// `mark_list`.
     MarkList,
+    /// `portal_script_set`.
+    PortalScriptSet,
+    /// `portal_script_clear`.
+    PortalScriptClear,
+    /// `portal_history`.
+    PortalHistory,
     /// `status`.
     Status,
 }
@@ -88,9 +104,17 @@ impl Verb {
             Self::WaitForWindow => "wait_for_window",
             Self::WaitForCommit => "wait_for_commit",
             Self::WaitForIdle => "wait_for_idle",
+            Self::GetTree => "get_tree",
+            Self::TreeFind => "tree_find",
+            Self::TreeDiff => "tree_diff",
+            Self::ClickNode => "click_node",
+            Self::NodeAction => "node_action",
             Self::GetChangesSince => "get_changes_since",
             Self::MarkSet => "mark_set",
             Self::MarkList => "mark_list",
+            Self::PortalScriptSet => "portal_script_set",
+            Self::PortalScriptClear => "portal_script_clear",
+            Self::PortalHistory => "portal_history",
             Self::Status => "status",
         }
     }
@@ -349,6 +373,26 @@ pub fn render(verb: Verb, r: &Value, outcome: &Outcome) -> String {
         Verb::WaitForIdle => {
             format!("workspace idle after {}ms quiet{}", r["quiet_ms"], at)
         }
+        Verb::GetTree => format_tree(r),
+        Verb::TreeFind => format_tree_find(r),
+        Verb::TreeDiff => format_tree_diff(r),
+        Verb::ClickNode => format!(
+            "clicked {} at ({},{}) x{} on {} (window {}){}",
+            r["button"],
+            r["x"],
+            r["y"],
+            r["clicked"],
+            r["ref"].as_str().unwrap_or("?"),
+            r["window"],
+            at,
+        ),
+        Verb::NodeAction => format!(
+            "performed {:?} on {} (window {}){}",
+            r["action"].as_str().unwrap_or("?"),
+            r["ref"].as_str().unwrap_or("?"),
+            r["window"],
+            at,
+        ),
         Verb::GetChangesSince => serde_json::to_string_pretty(r).unwrap_or_default(),
         Verb::MarkSet => {
             let mark = &r["mark"];
@@ -383,9 +427,79 @@ pub fn render(verb: Verb, r: &Value, outcome: &Outcome) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        Verb::PortalScriptSet => format!(
+            "queued {} script for {} (queue depth {}){}",
+            portal_response_name(r["response"].as_u64().unwrap_or(0)),
+            r["interface"].as_str().unwrap_or("?"),
+            r["queued"],
+            at,
+        ),
+        Verb::PortalScriptClear => {
+            let n = r["cleared"].as_u64().unwrap_or(0);
+            format!(
+                "cleared {} portal script{}{}",
+                n,
+                if n == 1 { "" } else { "s" },
+                at
+            )
+        }
+        Verb::PortalHistory => format_portal_history(r),
         Verb::Status => format_status(r),
         Verb::ClipboardGet => serde_json::to_string_pretty(r).unwrap_or_default(),
     }
+}
+
+/// The friendly name of a portal `Response` code.
+fn portal_response_name(code: u64) -> String {
+    match code {
+        0 => "accept".to_string(),
+        1 => "cancel".to_string(),
+        2 => "close".to_string(),
+        other => format!("code {other}"),
+    }
+}
+
+/// Human rendering of `portal_history`: one line per invocation.
+fn format_portal_history(r: &Value) -> String {
+    let invocations = r["invocations"].as_array();
+    match invocations {
+        None => return "no portal invocations".to_string(),
+        Some(list) if list.is_empty() => return "no portal invocations".to_string(),
+        _ => {}
+    }
+    invocations
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let mut line = format!(
+                "{}.{} caller={} response={} ({})",
+                e["interface"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("?"),
+                e["method"].as_str().unwrap_or("?"),
+                e["caller"].as_str().unwrap_or("?"),
+                portal_response_name(e["response"].as_u64().unwrap_or(9)),
+                if e["scripted"].as_bool().unwrap_or(false) {
+                    "scripted"
+                } else {
+                    "unscripted"
+                },
+            );
+            if let Some(uri) = e["arguments"]["uri"].as_str() {
+                line.push_str(&format!(" uri={uri}"));
+            }
+            if let Some(title) = e["arguments"]["title"].as_str()
+                && !title.is_empty()
+            {
+                line.push_str(&format!(" title=\"{title}\""));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One `list_windows` line.
@@ -428,6 +542,193 @@ fn result_data_len(r: &Value) -> usize {
         .unwrap_or(0)
 }
 
+/// Human rendering of `get_tree`: a snapshot header, one line per window
+/// and an indented `[eN] role "name" (x, y WxH)` per node — the compact
+/// canonical line shape `tree_find`/`tree_diff` reuse.
+fn format_tree(r: &Value) -> String {
+    let mut out = format!("snapshot {}", r["snapshot_id"]);
+    if let Some(seq) = r["seq"].as_u64() {
+        out.push_str(&format!(" (seq {seq})"));
+    }
+    if let Some(node_ref) = r["root_ref"].as_str() {
+        out.push_str(&format!(" scoped to {node_ref}"));
+    }
+    let tripped: Vec<&str> = r["truncation"]["tripped"]
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !tripped.is_empty() {
+        out.push_str(&format!(" truncated: {}", tripped.join(",")));
+    }
+    let Some(windows) = r["windows"].as_array() else {
+        out.push_str("\nno windows");
+        return out;
+    };
+    if windows.is_empty() {
+        out.push_str("\nno windows");
+        return out;
+    }
+    for w in windows {
+        out.push('\n');
+        out.push_str(&format_tree_window(w));
+    }
+    out
+}
+
+/// Human rendering of `tree_find`: a snapshot/match-count header, then
+/// each match's ref line followed by its canonical context block —
+/// context lines indented, the match line marked `>`.
+fn format_tree_find(r: &Value) -> String {
+    let count = r["match_count"].as_u64().unwrap_or(0);
+    let mut out = format!(
+        "snapshot {} — {}",
+        r["snapshot_id"],
+        if count == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{count} match{}", if count == 1 { "" } else { "es" })
+        }
+    );
+    let Some(matches) = r["matches"].as_array() else {
+        return out;
+    };
+    for m in matches {
+        out.push_str(&format!(
+            "\n{} {} {:?} (window {})",
+            m["ref"].as_str().unwrap_or("?"),
+            m["role"].as_str().unwrap_or("?"),
+            m["name"].as_str().unwrap_or(""),
+            m["window_id"],
+        ));
+        let context = &m["context"];
+        if let Some(before) = context["before"].as_array() {
+            for line in before {
+                out.push_str(&format!("\n    {}", line.as_str().unwrap_or("")));
+            }
+        }
+        if let Some(matched) = context["match"].as_str() {
+            out.push_str(&format!("\n  > {matched}"));
+        }
+        if let Some(after) = context["after"].as_array() {
+            for line in after {
+                out.push_str(&format!("\n    {}", line.as_str().unwrap_or("")));
+            }
+        }
+    }
+    out
+}
+
+/// Human rendering of `tree_diff`: a `from → to` header, then each
+/// hunk's `-`/`+` lines grouped by kind.
+fn format_tree_diff(r: &Value) -> String {
+    let changed = r["changed"].as_bool().unwrap_or(false);
+    let mut out = format!(
+        "diff snapshot {} → {}",
+        r["from_snapshot"], r["snapshot_id"]
+    );
+    if !changed {
+        out.push_str(" — no changes");
+        return out;
+    }
+    out.push_str(&format!(
+        " — {} added, {} removed",
+        r["added_lines"], r["removed_lines"]
+    ));
+    let Some(hunks) = r["hunks"].as_array() else {
+        return out;
+    };
+    for hunk in hunks {
+        out.push_str(&format!("\n{}", hunk["kind"].as_str().unwrap_or("changed")));
+        if let Some(removed) = hunk["removed"].as_array() {
+            for line in removed {
+                out.push_str(&format!("\n- {}", line.as_str().unwrap_or("")));
+            }
+        }
+        if let Some(added) = hunk["added"].as_array() {
+            for line in added {
+                out.push_str(&format!("\n+ {}", line.as_str().unwrap_or("")));
+            }
+        }
+    }
+    out
+}
+
+/// One `get_tree` window line plus its indented accessibility subtree.
+fn format_tree_window(w: &Value) -> String {
+    let g = &w["geometry"];
+    let mut line = format!(
+        "window {} {}{}({},{ } {}x{})  a11y={}",
+        w["window_id"],
+        w["app_id"]
+            .as_str()
+            .map(|s| format!("{s:?} "))
+            .unwrap_or_default(),
+        w["title"]
+            .as_str()
+            .map(|s| format!("{s:?} "))
+            .unwrap_or_default(),
+        g["x"],
+        g["y"],
+        g["width"],
+        g["height"],
+        w["a11y_status"].as_str().unwrap_or("?"),
+    );
+    if let Some(error) = w["a11y_error"].as_str() {
+        line.push_str(&format!(" — {error}"));
+    }
+    if let Some(hint) = w["hint"].as_str() {
+        line.push_str(&format!(" [{hint}]"));
+    }
+    if let Some(note) = w.pointer("/truncated/note").and_then(Value::as_str) {
+        line.push_str(&format!("\n  {note}"));
+    }
+    if let Some(root) = w.get("root").and_then(|r| r.as_object()) {
+        format_tree_node(&Value::Object(root.clone()), 0, &mut line);
+    }
+    line
+}
+
+/// One indented canonical tree line per node, depth-first, with
+/// `text=`/`value=` fields and `- ... <reason>` markers for cut branches.
+fn format_tree_node(node: &Value, depth: usize, out: &mut String) {
+    let indent = "  ".repeat(depth + 1);
+    let bounds = node["bounds"]
+        .as_object()
+        .map(|b| format!(" ({},{ } {}x{})", b["x"], b["y"], b["width"], b["height"]))
+        .unwrap_or_default();
+    let text = node["text"]
+        .as_str()
+        .map(|t| format!(" text={t:?}"))
+        .unwrap_or_default();
+    let value = node
+        .get("value")
+        .filter(|v| !v.is_null())
+        .map(|v| format!(" value={v}"))
+        .unwrap_or_default();
+    let value_text = node["value_text"]
+        .as_str()
+        .map(|t| format!(" value_text={t:?}"))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "\n{indent}[{}] {} {:?}{}{}{}{}",
+        node["ref"].as_str().unwrap_or("?"),
+        node["role"].as_str().unwrap_or("?"),
+        node["name"].as_str().unwrap_or(""),
+        bounds,
+        text,
+        value,
+        value_text,
+    ));
+    if let Some(children) = node["children"].as_array() {
+        for child in children {
+            format_tree_node(child, depth + 1, out);
+        }
+    }
+    if let Some(note) = node.pointer("/truncated/note").and_then(Value::as_str) {
+        out.push_str(&format!("\n{indent}  {note}"));
+    }
+}
+
 /// Human rendering of `status`: the narrative plus findings and next steps.
 fn format_status(r: &Value) -> String {
     let mut out = String::new();
@@ -435,13 +736,16 @@ fn format_status(r: &Value) -> String {
     if let Some(workspaces) = r["workspaces"].as_array() {
         for ws in workspaces {
             out.push_str(&format!(
-                "\n  {}: {} windows, compositor {}, {}",
+                "\n  {}: {} windows, compositor {}, bus session={} at_spi={}, portal={}, {}",
                 ws["id"].as_str().unwrap_or("?"),
                 ws["window_count"],
                 ws["compositor_responsive"]
                     .as_bool()
                     .map(|ok| if ok { "responsive" } else { "UNRESPONSIVE" })
                     .unwrap_or("?"),
+                ws["bus"]["session"]["state"].as_str().unwrap_or("?"),
+                ws["bus"]["at_spi"]["state"].as_str().unwrap_or("?"),
+                ws["portal"]["state"].as_str().unwrap_or("?"),
                 ws["healthy"]
                     .as_bool()
                     .map(|ok| if ok { "healthy" } else { "UNHEALTHY" })
