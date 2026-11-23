@@ -120,9 +120,13 @@ impl DaemonHandle {
             .socket_path
             .parent()
             .ok_or_else(|| Error::Backend("socket_path has no parent directory".into()))?;
+        let socket_dir_existed = socket_dir.exists();
         std::fs::create_dir_all(socket_dir).map_err(Error::Io)?;
         #[cfg(unix)]
-        {
+        if !socket_dir_existed {
+            // Only a directory we created gets 0700 — chmod'ing a shared
+            // pre-existing parent (e.g. /tmp, XDG_RUNTIME_DIR) would both
+            // fail and, when it didn't, lock other clients out.
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(Error::Io)?;
@@ -173,6 +177,20 @@ impl DaemonHandle {
     /// The daemon's state directory.
     pub fn state_dir(&self) -> &PathBuf {
         &self.state_dir
+    }
+
+    /// Blocks until the daemon's serve loop ends on its own — on
+    /// SIGINT/SIGTERM or an internal shutdown — then joins the server
+    /// thread. Unlike [`Self::shutdown`] this never asks the daemon to
+    /// stop; it is the foreground `scry daemon` wait path.
+    pub fn wait(mut self) -> crate::Result<()> {
+        match self.join.take() {
+            Some(join) => match join.join() {
+                Ok(result) => result,
+                Err(_) => Err(Error::Backend("daemon thread panicked".into())),
+            },
+            None => Ok(()),
+        }
     }
 
     /// Shuts the daemon down: closes every workspace, removes the control
