@@ -435,13 +435,15 @@ fn format_status(r: &Value) -> String {
     if let Some(workspaces) = r["workspaces"].as_array() {
         for ws in workspaces {
             out.push_str(&format!(
-                "\n  {}: {} windows, compositor {}, {}",
+                "\n  {}: {} windows, compositor {}, bus session={} at_spi={}, {}",
                 ws["id"].as_str().unwrap_or("?"),
                 ws["window_count"],
                 ws["compositor_responsive"]
                     .as_bool()
                     .map(|ok| if ok { "responsive" } else { "UNRESPONSIVE" })
                     .unwrap_or("?"),
+                ws["bus"]["session"]["state"].as_str().unwrap_or("?"),
+                ws["bus"]["at_spi"]["state"].as_str().unwrap_or("?"),
                 ws["healthy"]
                     .as_bool()
                     .map(|ok| if ok { "healthy" } else { "UNHEALTHY" })

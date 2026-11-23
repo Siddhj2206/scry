@@ -30,6 +30,7 @@ use crate::{
     Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
     compositor::{JoinOutcome, join_bounded},
     daemon::{
+        bus::BusManager,
         changelog::{ChangeLog, Mark},
         now_ms,
         process::{ProcessInfo, ProcessRegistry, SpawnSpec},
@@ -155,6 +156,9 @@ pub struct Workspace {
     recent: Arc<Mutex<VecDeque<CompositorEvent>>>,
     /// Managed children spawned by `spawn_app`, tracked until teardown.
     processes: ProcessRegistry,
+    /// The workspace's private D-Bus session bus, AT-SPI2 bus and
+    /// `at-spi2-registryd` — launched at creation, torn down with it.
+    buses: BusManager,
     /// Bounded seq-indexed event log plus named marks — the state behind
     /// `get_changes_since`, `mark_set` and `mark_list`. Shared with the
     /// event-pump thread.
@@ -236,11 +240,24 @@ impl Workspace {
                 })?
         };
 
+        // The private buses launch alongside the compositor, binding
+        // sockets inside the same runtime dir. Blocking-friendly: socket
+        // binds, process spawns and a bounded readiness wait.
+        let buses = {
+            let runtime_dir = handle.runtime_dir().to_owned();
+            tokio::task::spawn_blocking(move || BusManager::start(runtime_dir))
+                .await
+                .map_err(|err| {
+                    ErrorResponse::new(code::INTERNAL, format!("bus task failed: {err}"))
+                })?
+        };
+
         let workspace = Self {
             meta_path: state_dir.join("workspaces").join(format!("{id}.json")),
             id,
             options,
             handle,
+            buses,
             compositor: Mutex::new(Some(compositor)),
             pump: Mutex::new(Some(pump)),
             closing: CancellationToken::new(),
@@ -361,9 +378,12 @@ impl Workspace {
         if self.closing.is_cancelled() {
             return Err(closing());
         }
-        let info =
-            self.processes
-                .spawn(spec, self.handle.runtime_dir(), self.handle.socket_name())?;
+        let info = self.processes.spawn(
+            spec,
+            self.handle.runtime_dir(),
+            self.handle.socket_name(),
+            &self.buses.spawn_env(),
+        )?;
         if self.closing.is_cancelled() {
             // Teardown raced the spawn: make sure nothing escapes.
             self.processes.terminate_all();
@@ -379,6 +399,12 @@ impl Workspace {
     /// process detail behind `workspace_list` and `status`.
     pub fn process_snapshot(&self) -> Vec<ProcessInfo> {
         self.processes.snapshot()
+    }
+
+    /// Per-endpoint health of the workspace's private session D-Bus and
+    /// AT-SPI2 buses — the `bus` section of `workspace_list` and `status`.
+    pub fn bus_report(&self) -> Value {
+        self.buses.report()
     }
 
     /// Attaches a named mark to the workspace's seq timeline (`mark_set`).
@@ -456,6 +482,7 @@ impl Workspace {
             "last_active_ms": self.last_active_ms.load(Ordering::Relaxed),
             "processes": self.processes.snapshot(),
             "active_waits": self.active_waits(),
+            "bus": self.buses.report(),
         })
     }
 
@@ -508,8 +535,10 @@ impl Workspace {
         self.closing.cancel();
         // Children die first (SIGTERM, then bounded SIGKILL) while their
         // Wayland connection still works, so well-behaved apps can exit
-        // cleanly.
+        // cleanly. The private bus daemons go down right after — before
+        // the compositor's runtime dir (and their sockets) are removed.
         self.processes.terminate_all();
+        self.buses.terminate_all();
         let compositor = self
             .compositor
             .lock()
