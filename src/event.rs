@@ -49,7 +49,7 @@ pub struct WindowId(pub u64);
 pub struct SurfaceId(pub u64);
 
 /// Structured metadata describing one mapped toplevel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowInfo {
     /// Stable identifier for the lifetime of the mapping.
     pub id: WindowId,
@@ -63,6 +63,10 @@ pub struct WindowInfo {
     pub pid: Option<u32>,
     /// Whether the toplevel currently carries the `activated` state.
     pub activated: bool,
+    /// The scale factor advertised to this window's surfaces: the highest
+    /// scale of the virtual outputs it overlaps. This is the value reported
+    /// through `wp_fractional_scale_v1` / `preferred_buffer_scale`.
+    pub scale: f64,
 }
 
 /// Structured metadata describing one mapped `xdg_popup`.
