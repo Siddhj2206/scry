@@ -46,6 +46,8 @@ mod compositor;
 mod error;
 mod event;
 mod handle;
+/// Synthetic input types (`wl_seat` pointer/keyboard/text injection).
+pub mod input;
 mod state;
 
 pub use compositor::Compositor;

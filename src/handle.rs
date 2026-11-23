@@ -16,6 +16,7 @@ use smithay::reexports::calloop::channel::Sender as CommandSender;
 use crate::{
     error::{Error, Result},
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
+    input::{PointerButton, PointerTarget},
 };
 
 /// How long a command waits for the compositor's reply before giving up.
@@ -60,6 +61,53 @@ pub(crate) enum Command {
     },
     /// Ask a toplevel to close (`xdg_toplevel.close`).
     CloseWindow {
+        id: WindowId,
+        reply: Sender<Outcome<()>>,
+    },
+
+    // -- input ---------------------------------------------------------------
+    /// Move the pointer to a position in the target's coordinate space,
+    /// sending enter/motion/leave as needed.
+    PointerMotion {
+        target: PointerTarget,
+        x: f64,
+        y: f64,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Press or release an evdev pointer button at the current location.
+    PointerButton {
+        /// evdev button code (e.g. `BTN_LEFT` = 0x110).
+        button: u32,
+        pressed: bool,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Emit one scroll axis frame (wheel source) at the current location.
+    PointerScroll {
+        /// Horizontal delta; negative scrolls left. 15.0 = one detent.
+        x: f64,
+        /// Vertical delta; negative scrolls up. 15.0 = one detent.
+        y: f64,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Press or release a physical key by name.
+    KeyEvent {
+        name: String,
+        pressed: bool,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Hold `modifiers`, tap `name`, release the modifiers.
+    KeyCombo {
+        name: String,
+        modifiers: Vec<String>,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Inject text, preferring `zwp_text_input_v3` with an XKB fallback.
+    TypeText {
+        text: String,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Raise and keyboard-focus a window.
+    FocusWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
     },
@@ -142,6 +190,118 @@ impl CompositorHandle {
     /// Requests `xdg_toplevel.close` for a window.
     pub fn close_window(&self, id: WindowId) -> Result<Reply<()>> {
         self.request(|reply| Command::CloseWindow { id, reply })
+    }
+
+    // -- synthetic input -----------------------------------------------------
+
+    /// Moves the virtual pointer, delivering `wl_pointer` enter/motion/leave
+    /// to whatever surface ends up underneath.
+    ///
+    /// - [`PointerTarget::Output`]: global logical output coordinates; the
+    ///   topmost surface under the point is entered.
+    /// - [`PointerTarget::Window`]: coordinates relative to that window's
+    ///   logical top-left corner — the named window is targeted even when
+    ///   covered by others; points outside it fail with
+    ///   [`Error::OutsideWindow`].
+    pub fn move_pointer(&self, target: PointerTarget, x: f64, y: f64) -> Result<Reply<()>> {
+        self.request(|reply| Command::PointerMotion {
+            target,
+            x,
+            y,
+            reply,
+        })
+    }
+
+    /// Presses `button` at the current pointer position.
+    ///
+    /// A press is also the click-to-focus trigger: the toplevel owning the
+    /// pressed surface is raised and focused (unless a popup grab reroutes
+    /// the press, in which case normal grab semantics apply).
+    pub fn press_pointer_button(&self, button: PointerButton) -> Result<Reply<()>> {
+        let button = button.code()?;
+        self.request(|reply| Command::PointerButton {
+            button,
+            pressed: true,
+            reply,
+        })
+    }
+
+    /// Releases `button` at the current pointer position.
+    pub fn release_pointer_button(&self, button: PointerButton) -> Result<Reply<()>> {
+        let button = button.code()?;
+        self.request(|reply| Command::PointerButton {
+            button,
+            pressed: false,
+            reply,
+        })
+    }
+
+    /// Emits a single wheel-axis scroll frame at the current pointer
+    /// position.
+    ///
+    /// `x`/`y` are continuous deltas in compositor axis units; `±15.0`
+    /// corresponds to one wheel detent (also reported as `±120` through
+    /// `wl_pointer.axis_v120` for clients that want discrete steps).
+    pub fn scroll_pointer(&self, x: f64, y: f64) -> Result<Reply<()>> {
+        self.request(|reply| Command::PointerScroll { x, y, reply })
+    }
+
+    /// Presses the physical key named `key`.
+    ///
+    /// Names are XKB keysym names resolved case-insensitively (`a`, `F5`,
+    /// `Return`, `space`, `Left`, …) plus convenience aliases (`ctrl`, `alt`,
+    /// `super`, `enter`, `esc`, `pgup`, …). Keysyms living on shifted keymap
+    /// levels hold Shift (or AltGr) implicitly until the matching release.
+    /// Unknown names fail with [`Error::UnknownKey`].
+    pub fn press_key(&self, key: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::KeyEvent {
+            name: key.to_string(),
+            pressed: true,
+            reply,
+        })
+    }
+
+    /// Releases the physical key named `key` (see [`Self::press_key`]).
+    pub fn release_key(&self, key: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::KeyEvent {
+            name: key.to_string(),
+            pressed: false,
+            reply,
+        })
+    }
+
+    /// Taps `key` while holding `modifiers` — e.g. `key("c", &["ctrl"])`
+    /// sends a Ctrl+C. Modifier names: `ctrl`, `shift`, `alt`, `super`
+    /// (aliases `logo`/`meta`/`win`/`cmd`), `altgr`, `capslock`, `numlock`.
+    /// Unrecognised modifier names fail with [`Error::UnknownModifier`].
+    pub fn key(&self, key: &str, modifiers: &[&str]) -> Result<Reply<()>> {
+        self.request(|reply| Command::KeyCombo {
+            name: key.to_string(),
+            modifiers: modifiers.iter().map(|m| m.to_string()).collect(),
+            reply,
+        })
+    }
+
+    /// Injects text into the focused window.
+    ///
+    /// When the focused client owns an enabled `zwp_text_input_v3` instance
+    /// the whole string is committed through it (arbitrary UTF-8, including
+    /// accents and emoji). Otherwise each character is typed as physical XKB
+    /// key events; characters no keymap keysym produces fail with
+    /// [`Error::UnmappableCharacter`] rather than being dropped silently.
+    /// Fails with [`Error::NoFocusedSurface`] when nothing is focused.
+    pub fn type_text(&self, text: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::TypeText {
+            text: text.to_string(),
+            reply,
+        })
+    }
+
+    /// Raises `id` to the top of the stacking order and moves keyboard and
+    /// `zwp_text_input_v3` focus to it, toggling `Activated` on the affected
+    /// toplevels.
+    pub fn focus_window(&self, id: WindowId) -> Result<Reply<()>> {
+        self.request(|reply| Command::FocusWindow { id, reply })
     }
 
     /// Shuts the compositor down: the event loop stops, all clients are

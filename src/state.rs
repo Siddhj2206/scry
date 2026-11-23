@@ -6,16 +6,25 @@
 //! [`CompositorEvent`]s over subscription channels.
 
 use std::{
+    collections::HashMap,
     os::unix::net::UnixStream,
     sync::{Arc, Mutex, OnceLock, mpsc::Sender as ReplySender},
+    time::Instant,
 };
 
 use smithay::{
     backend::renderer::utils::{
         CommitCounter, on_commit_buffer_handler, with_renderer_surface_state,
     },
-    desktop::{PopupKind, PopupManager, Space, Window},
-    input::{SeatHandler, SeatState},
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Space,
+        Window, find_popup_root_surface,
+    },
+    input::{
+        Seat, SeatHandler, SeatState,
+        keyboard::{KeyboardHandle, Keycode, Keysym, XkbConfig},
+        pointer::{Focus, PointerHandle},
+    },
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
@@ -23,7 +32,10 @@ use smithay::{
             channel::{Channel, Event as ChannelEvent},
             generic::Generic,
         },
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::{
+            wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+            xdg::shell::server::xdg_toplevel,
+        },
         wayland_server::{
             Client, Display, DisplayHandle, ListeningSocket, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
@@ -42,10 +54,14 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         seat::WaylandFocus,
         shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XDG_TOPLEVEL_ROLE, XdgShellHandler,
-            XdgShellState, XdgToplevelSurfaceData,
+            PopupSurface, PositionerState, ToplevelSurface, XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE,
+            XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
+        text_input::TextInputManagerState,
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 use tracing::{debug, error, info, warn};
@@ -54,6 +70,7 @@ use crate::{
     error::Error,
     event::{CompositorEvent, Rect, Seq, SurfaceId, WindowId, WindowInfo},
     handle::{Command, Reply},
+    input::TextInputTracker,
 };
 
 /// Size of the single virtual output every `Compositor` starts with.
@@ -86,9 +103,9 @@ impl ClientData for ClientState {
 }
 
 /// A mapped toplevel plus the metadata snapshot last reported for it.
-struct WindowRecord {
-    id: WindowId,
-    window: Window,
+pub(crate) struct WindowRecord {
+    pub id: WindowId,
+    pub window: Window,
     last_info: WindowInfo,
 }
 
@@ -99,12 +116,36 @@ pub(crate) struct ScryState {
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
     seat_state: SeatState<ScryState>,
+    /// Retained so the `zwp_text_input_manager_v3` global stays advertised.
+    #[allow(dead_code)]
+    text_input_manager_state: TextInputManagerState,
+    xdg_activation_state: XdgActivationState,
     #[allow(dead_code)] // retained so the xdg_output_manager global lives
     output_manager_state: OutputManagerState,
 
+    // -- input ----------------------------------------------------------------
+    /// The single virtual seat every instance runs.
+    pub(crate) seat: Seat<ScryState>,
+    /// The seat's keyboard (XKB keymap + state + wl_keyboard forwarding).
+    pub(crate) keyboard: KeyboardHandle<ScryState>,
+    /// The seat's pointer (wl_pointer forwarding + grabs).
+    pub(crate) pointer: PointerHandle<ScryState>,
+    /// The currently keyboard-focused window, if any.
+    pub(crate) focused: Option<WindowId>,
+    /// Times each keycode is logically held (explicit + implicit presses).
+    pub(crate) key_holds: HashMap<Keycode, u32>,
+    /// Modifier keycodes pressed implicitly for a held level>0 keysym.
+    pub(crate) implicit_mods: HashMap<Keycode, Vec<Keycode>>,
+    /// keysym → resolved (keycode, implicit modifiers) cache.
+    pub(crate) keymap_cache: HashMap<Keysym, Option<crate::input::keymap::ResolvedKey>>,
+    /// zwp_text_input_v3 instance enable/commit-serial tracking.
+    pub(crate) text_input_tracker: TextInputTracker,
+    /// Monotonic base for wayland event timestamps.
+    pub(crate) clock: Instant,
+
     // -- desktop model ------------------------------------------------------
-    space: Space<Window>,
-    popup_manager: PopupManager,
+    pub(crate) space: Space<Window>,
+    pub(crate) popup_manager: PopupManager,
     /// The always-present virtual output. Used by later sub-issues for frame
     /// callbacks, captures and output management; kept alive so its global
     /// stays advertised.
@@ -115,7 +156,7 @@ pub(crate) struct ScryState {
     /// Toplevels that were created but have not committed a buffer yet.
     pending_toplevels: Vec<ToplevelSurface>,
     /// Currently mapped toplevel windows.
-    windows: Vec<WindowRecord>,
+    pub(crate) windows: Vec<WindowRecord>,
     /// Monotonic event/ack sequence counter.
     seq: Seq,
     next_window_id: u64,
@@ -155,12 +196,42 @@ impl ScryState {
         let mut space = Space::default();
         space.map_output(&default_output, (0, 0));
 
+        let mut seat_state = SeatState::new();
+        let mut seat = seat_state.new_wl_seat(dh, "seat0");
+        // An explicit keymap keeps input deterministic regardless of
+        // XKB_DEFAULT_* environment variables on the host.
+        let keyboard = seat
+            .add_keyboard(
+                XkbConfig {
+                    rules: "evdev",
+                    model: "pc105",
+                    layout: "us",
+                    variant: "",
+                    options: None,
+                },
+                200,
+                25,
+            )
+            .expect("failed to load default xkb keymap");
+        let pointer = seat.add_pointer();
+
         Self {
             compositor_state: CompositorState::new_v6::<Self>(dh),
             xdg_shell_state: XdgShellState::new::<Self>(dh),
             shm_state: ShmState::new::<Self>(dh, vec![]),
-            seat_state: SeatState::new(),
+            seat_state,
+            text_input_manager_state: TextInputManagerState::new::<Self>(dh),
+            xdg_activation_state: XdgActivationState::new::<Self>(dh),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
+            seat,
+            keyboard,
+            pointer,
+            focused: None,
+            key_holds: HashMap::new(),
+            implicit_mods: HashMap::new(),
+            keymap_cache: HashMap::new(),
+            text_input_tracker: TextInputTracker::default(),
+            clock: Instant::now(),
             space,
             popup_manager: PopupManager::default(),
             default_output,
@@ -198,7 +269,7 @@ impl ScryState {
     }
 
     /// Assigns the next sequence number to `event` and broadcasts it.
-    fn emit(&mut self, event: impl FnOnce(Seq) -> CompositorEvent) {
+    pub(crate) fn emit(&mut self, event: impl FnOnce(Seq) -> CompositorEvent) {
         self.seq += 1;
         let event = event(self.seq);
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
@@ -251,11 +322,25 @@ impl ScryState {
     }
 
     /// Resolves the mapped window owning `surface`, following subsurface
-    /// parents up to their root surface.
-    fn window_id_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
+    /// and popup parents up to their root surface.
+    pub(crate) fn window_id_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
         let mut root = surface.clone();
-        while let Some(parent) = get_parent(&root) {
-            root = parent;
+        loop {
+            if let Some(parent) = get_parent(&root) {
+                root = parent;
+                continue;
+            }
+            if get_role(&root) == Some(XDG_POPUP_ROLE) {
+                let Some(popup) = self.popup_manager.find_popup(&root) else {
+                    break;
+                };
+                let Ok(parent) = find_popup_root_surface(&popup) else {
+                    break;
+                };
+                root = parent;
+                continue;
+            }
+            break;
         }
         self.windows
             .iter()
@@ -363,6 +448,9 @@ impl ScryState {
                     seq,
                     window_id: record.id,
                 });
+                if self.focused == Some(record.id) {
+                    self.focus_fallback();
+                }
                 return;
             }
             let info = self.window_info(self.windows[pos].id, &self.windows[pos].window);
@@ -395,10 +483,12 @@ impl ScryState {
         let info = self.window_info(id, &window);
         self.windows.push(WindowRecord {
             id,
-            window,
+            window: window.clone(),
             last_info: info.clone(),
         });
         self.emit(|seq| CompositorEvent::WindowMapped { seq, window: info });
+        // Newly mapped toplevels take focus, matching stacking-WM behavior.
+        self.focus_window(&window);
     }
 
     /// A toplevel is going away, whether it was mapped or still pending.
@@ -418,6 +508,9 @@ impl ScryState {
                 seq,
                 window_id: record.id,
             });
+            if self.focused == Some(record.id) {
+                self.focus_fallback();
+            }
         }
     }
 
@@ -433,6 +526,79 @@ impl ScryState {
     /// Executes one [`Command`] coming from a [`crate::CompositorHandle`].
     fn handle_command(&mut self, command: Command) {
         match command {
+            Command::PointerMotion {
+                target,
+                x,
+                y,
+                reply,
+            } => {
+                let outcome = self.cmd_pointer_motion(target, x, y);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::PointerButton {
+                button,
+                pressed,
+                reply,
+            } => {
+                let outcome = self.cmd_pointer_button(button, pressed);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::PointerScroll { x, y, reply } => {
+                let outcome = self.cmd_pointer_scroll(x, y);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::KeyEvent {
+                name,
+                pressed,
+                reply,
+            } => {
+                let outcome = self.cmd_key_event(&name, pressed);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::KeyCombo {
+                name,
+                modifiers,
+                reply,
+            } => {
+                let outcome = self.cmd_key_combo(&name, &modifiers);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::TypeText { text, reply } => {
+                let outcome = self.cmd_type_text(&text);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
+            Command::FocusWindow { id, reply } => {
+                let outcome = self.cmd_focus_window(id);
+                self.seq += 1;
+                let _ = reply.send(outcome.map(|value| Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
             Command::Shutdown { reply } => {
                 let _ = reply.send(Ok(Reply {
                     seq: self.seq,
@@ -568,10 +734,39 @@ impl XdgShellHandler for ScryState {
         }
     }
 
-    fn grab(&mut self, surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // No seat is advertised yet; popup grabs arrive with the input
-        // sub-issue. Dismiss politely instead of leaving the popup stuck.
-        surface.send_popup_done();
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            warn!("popup grab for unknown seat");
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            warn!("popup grab without a live parent");
+            return;
+        };
+        let Ok(mut grab) = self.popup_manager.grab_popup(root, kind, &seat, serial) else {
+            return;
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 
     fn reposition_request(
@@ -605,12 +800,59 @@ impl SeatHandler for ScryState {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
+
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let id = focused.and_then(|surface| self.window_id_for_surface(surface));
+        if self.focused != id {
+            self.focused = id;
+            self.emit(|seq| CompositorEvent::WindowFocused { seq, window_id: id });
+        }
+    }
+}
+
+impl XdgActivationHandler for ScryState {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        _token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        if let Some(id) = self.window_id_for_surface(&surface) {
+            if let Err(err) = self.focus_window_id(id) {
+                debug!("activation for unmapped window: {err}");
+            }
+        } else {
+            debug!("activation request for an unknown surface");
+        }
+        self.xdg_activation_state.remove_token(&token);
+    }
 }
 
 smithay::delegate_compositor!(ScryState);
 smithay::delegate_shm!(ScryState);
 smithay::delegate_xdg_shell!(ScryState);
 smithay::delegate_output!(ScryState);
+smithay::delegate_seat!(ScryState);
+smithay::delegate_xdg_activation!(ScryState);
+
+// zwp_text_input_v3: the manager global + its dispatch are delegated to
+// smithay's state, while ZwpTextInputV3 requests are dispatched to ScryState's
+// own impl (src/input/text_input.rs), which additionally tracks enable state
+// and commit serials for IME-less text injection.
+smithay::reexports::wayland_server::delegate_global_dispatch!(ScryState: [
+    ZwpTextInputManagerV3: ()
+] => TextInputManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(ScryState: [
+    ZwpTextInputManagerV3: ()
+] => TextInputManagerState);
 
 // -- event loop entry point ---------------------------------------------------
 

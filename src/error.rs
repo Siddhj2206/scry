@@ -36,4 +36,32 @@ pub enum Error {
     /// A command targeted a window id that no longer exists.
     #[error("unknown window id: {0:?}")]
     UnknownWindow(WindowId),
+
+    /// A key name did not resolve to a keysym, or the keymap has no key
+    /// producing that keysym.
+    #[error("unknown key name or unmapped keysym: {0:?}")]
+    UnknownKey(String),
+
+    /// A modifier name was not recognised.
+    #[error("unknown modifier: {0:?}")]
+    UnknownModifier(String),
+
+    /// A pointer button code outside the evdev button range (0x100–0x2FF).
+    #[error("invalid pointer button code: {0:#x}")]
+    InvalidButton(u32),
+
+    /// A window-local pointer target fell outside the window's surfaces
+    /// (including its subsurfaces and popups).
+    #[error("point is outside window {0:?}")]
+    OutsideWindow(WindowId),
+
+    /// Key or text input was requested while no surface has keyboard focus.
+    #[error("no focused surface")]
+    NoFocusedSurface,
+
+    /// A character could not be typed through XKB because no key on the
+    /// keymap produces its keysym (only the `zwp_text_input_v3` path can
+    /// deliver arbitrary Unicode).
+    #[error("character is not typeable through the xkb fallback: {0:?}")]
+    UnmappableCharacter(char),
 }
