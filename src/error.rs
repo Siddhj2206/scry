@@ -5,7 +5,7 @@ use std::io;
 use smithay::reexports::wayland_server::BindError;
 use thiserror::Error;
 
-use crate::event::WindowId;
+use crate::{clipboard::SelectionKind, event::WindowId};
 
 /// Result alias for fallible `scry` operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -64,4 +64,35 @@ pub enum Error {
     /// deliver arbitrary Unicode).
     #[error("character is not typeable through the xkb fallback: {0:?}")]
     UnmappableCharacter(char),
+
+    /// A command targeted an output name that does not exist.
+    #[error("unknown output: {0}")]
+    UnknownOutput(String),
+
+    /// An [`crate::OutputSpec`] failed validation.
+    #[error("invalid output spec: {0}")]
+    InvalidOutputSpec(String),
+
+    /// A frame capture could not be produced.
+    #[error("capture failed: {0}")]
+    Capture(String),
+
+    /// Encoding a captured frame failed.
+    #[error("frame encoding failed: {0}")]
+    Encode(#[from] image::ImageError),
+
+    /// A read was requested on a selection that is currently empty.
+    #[error("the {0} selection is empty")]
+    EmptySelection(SelectionKind),
+
+    /// The current selection does not offer the requested MIME type.
+    #[error("the {kind} selection does not offer mime type {requested:?} (offers: {offered:?})")]
+    MimeTypeNotOffered {
+        /// Which selection was read.
+        kind: SelectionKind,
+        /// The MIME type that was requested.
+        requested: String,
+        /// MIME types the selection actually offers.
+        offered: Vec<String>,
+    },
 }

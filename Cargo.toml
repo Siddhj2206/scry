@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "webp",
+] }
 signal-hook = "0.3"
 smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
@@ -11,6 +15,7 @@ smithay = { version = "0.7", default-features = false, features = [
 ] }
 tempfile = "3"
 thiserror = "2"
+tiny-skia = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 

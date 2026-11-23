@@ -6,6 +6,8 @@
 
 use smithay::utils::Rectangle;
 
+use crate::clipboard::SelectionKind;
+
 /// A monotonic sequence number assigned by the compositor.
 ///
 /// Sequence numbers start at `1` and increase by one for every emitted event
@@ -47,7 +49,7 @@ pub struct WindowId(pub u64);
 pub struct SurfaceId(pub u64);
 
 /// Structured metadata describing one mapped toplevel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowInfo {
     /// Stable identifier for the lifetime of the mapping.
     pub id: WindowId,
@@ -61,6 +63,23 @@ pub struct WindowInfo {
     pub pid: Option<u32>,
     /// Whether the toplevel currently carries the `activated` state.
     pub activated: bool,
+    /// The scale factor advertised to this window's surfaces: the highest
+    /// scale of the virtual outputs it overlaps. This is the value reported
+    /// through `wp_fractional_scale_v1` / `preferred_buffer_scale`.
+    pub scale: f64,
+}
+
+/// Structured metadata describing one mapped `xdg_popup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupInfo {
+    /// Identifier of the popup's `wl_surface`.
+    pub surface_id: SurfaceId,
+    /// The window the popup is anchored to, if its parent surface belongs to
+    /// a mapped window.
+    pub window_id: Option<WindowId>,
+    /// The popup's positioner geometry: position relative to the parent's
+    /// window geometry, and size in surface-local coordinates.
+    pub geometry: Rect,
 }
 
 /// An event emitted by the compositor on its ordered event stream.
@@ -105,6 +124,21 @@ pub enum CompositorEvent {
         /// The newly focused window, or `None` when focus was cleared.
         window_id: Option<WindowId>,
     },
+    /// An `xdg_popup` mapped: its first buffer commit became visible.
+    PopupMapped {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// Metadata snapshot at map time.
+        popup: PopupInfo,
+    },
+    /// A mapped `xdg_popup` closed (destroyed, dismissed, or unmapped via a
+    /// null buffer).
+    PopupClosed {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// Identifier of the popup's `wl_surface`.
+        surface_id: SurfaceId,
+    },
     /// A `wl_surface` commit was applied.
     ///
     /// `damage` is normalized to buffer coordinates, already accounting for
@@ -122,6 +156,21 @@ pub enum CompositorEvent {
         /// Damaged regions in buffer coordinates.
         damage: Vec<Rect>,
     },
+    /// A clipboard or primary selection changed ownership or offered MIME
+    /// types.
+    ///
+    /// Emitted when a client sets or clears a selection and when the
+    /// compositor itself sets or clears one via
+    /// [`CompositorHandle::set_selection`](crate::CompositorHandle::set_selection).
+    /// An empty `mime_types` means the selection was cleared.
+    ClipboardUpdated {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// Which selection changed.
+        selection: SelectionKind,
+        /// MIME types the new selection offers; empty when cleared.
+        mime_types: Vec<String>,
+    },
 }
 
 impl CompositorEvent {
@@ -132,7 +181,10 @@ impl CompositorEvent {
             | Self::WindowUpdated { seq, .. }
             | Self::WindowClosed { seq, .. }
             | Self::WindowFocused { seq, .. }
-            | Self::SurfaceCommitted { seq, .. } => *seq,
+            | Self::PopupMapped { seq, .. }
+            | Self::PopupClosed { seq, .. }
+            | Self::SurfaceCommitted { seq, .. }
+            | Self::ClipboardUpdated { seq, .. } => *seq,
         }
     }
 }

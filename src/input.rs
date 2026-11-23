@@ -16,6 +16,9 @@
 pub(crate) mod keymap;
 mod text_input;
 
+use smithay::wayland::selection::{
+    data_device::set_data_device_focus, primary_selection::set_primary_focus,
+};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState},
     desktop::{Window, WindowSurfaceType},
@@ -444,7 +447,10 @@ impl ScryState {
                 let serial = SERIAL_COUNTER.next_serial();
                 self.set_keyboard_focus(None, serial);
                 // SeatHandler::focus_changed is only invoked on Some→Some
-                // transitions; report the cleared focus here.
+                // transitions, so clear selection focus and report the
+                // cleared focus here.
+                set_data_device_focus(&self.display_handle, &self.seat, None);
+                set_primary_focus(&self.display_handle, &self.seat, None);
                 if self.focused.is_some() {
                     self.focused = None;
                     self.emit(|seq| CompositorEvent::WindowFocused {

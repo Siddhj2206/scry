@@ -14,9 +14,13 @@ use std::{
 use smithay::reexports::calloop::channel::Sender as CommandSender;
 
 use crate::{
+    clipboard::SelectionKind,
     error::{Error, Result},
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
+    frame::Frame,
+    frame_clock::FrameClockMode,
     input::{PointerButton, PointerTarget},
+    output::{OutputInfo, OutputSpec},
 };
 
 /// How long a command waits for the compositor's reply before giving up.
@@ -33,6 +37,22 @@ pub struct Reply<T> {
     pub seq: Seq,
     /// The command's return value.
     pub value: T,
+}
+
+impl<T> Reply<T> {
+    /// Maps the reply value, keeping `seq` and propagating errors.
+    pub(crate) fn try_map<U, E>(
+        self,
+        f: impl FnOnce(T) -> std::result::Result<U, E>,
+    ) -> Result<Reply<U>>
+    where
+        Error: From<E>,
+    {
+        Ok(Reply {
+            seq: self.seq,
+            value: f(self.value)?,
+        })
+    }
 }
 
 /// The payload carried back over a reply channel.
@@ -110,6 +130,65 @@ pub(crate) enum Command {
     FocusWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
+    },
+    /// Composite a window's complete surface tree (root, subsurfaces and
+    /// popups) into an occlusion-free frame.
+    CaptureWindow {
+        id: WindowId,
+        reply: Sender<Outcome<Frame>>,
+    },
+    /// Composite all visible windows in z-order over a named output.
+    CaptureOutput {
+        name: String,
+        reply: Sender<Outcome<Frame>>,
+    },
+    /// Snapshot all registered virtual outputs.
+    Outputs {
+        reply: Sender<Outcome<Vec<OutputInfo>>>,
+    },
+    /// Add or reconfigure a virtual output.
+    UpdateOutput {
+        spec: OutputSpec,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Remove a virtual output by `wl_output` name.
+    RemoveOutput {
+        name: String,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Switch the virtual frame clock between realtime and paused modes.
+    SetFrameClockMode {
+        mode: FrameClockMode,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Advance the virtual frame clock by `duration`, releasing any pending
+    /// `wl_surface.frame` callbacks with the stepped timestamp.
+    StepFrameClock {
+        duration: Duration,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Install a compositor-provided selection (clipboard or primary).
+    SetSelection {
+        kind: SelectionKind,
+        mime: String,
+        data: Vec<u8>,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Clear a selection (clipboard or primary).
+    ClearSelection {
+        kind: SelectionKind,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Read a selection's contents negotiated to `mime`.
+    ReadSelection {
+        kind: SelectionKind,
+        mime: String,
+        reply: Sender<Outcome<Vec<u8>>>,
+    },
+    /// List the MIME types a selection currently offers.
+    SelectionMimeTypes {
+        kind: SelectionKind,
+        reply: Sender<Outcome<Vec<String>>>,
     },
 }
 
@@ -212,11 +291,9 @@ impl CompositorHandle {
         })
     }
 
-    /// Presses `button` at the current pointer position.
-    ///
-    /// A press is also the click-to-focus trigger: the toplevel owning the
-    /// pressed surface is raised and focused (unless a popup grab reroutes
-    /// the press, in which case normal grab semantics apply).
+    /// Presses an evdev [`PointerButton`] (e.g. `PointerButton::Left`) at the
+    /// pointer's current location. Pressing on an unfocused toplevel raises
+    /// and focuses it (click-to-focus).
     pub fn press_pointer_button(&self, button: PointerButton) -> Result<Reply<()>> {
         let button = button.code()?;
         self.request(|reply| Command::PointerButton {
@@ -226,7 +303,7 @@ impl CompositorHandle {
         })
     }
 
-    /// Releases `button` at the current pointer position.
+    /// Releases a previously pressed [`PointerButton`].
     pub fn release_pointer_button(&self, button: PointerButton) -> Result<Reply<()>> {
         let button = button.code()?;
         self.request(|reply| Command::PointerButton {
@@ -236,11 +313,8 @@ impl CompositorHandle {
         })
     }
 
-    /// Emits a single wheel-axis scroll frame at the current pointer
-    /// position.
-    ///
-    /// `x`/`y` are continuous deltas in compositor axis units; `±15.0`
-    /// corresponds to one wheel detent (also reported as `±120` through
+    /// Emits a complete pointer scroll frame at the current location: both
+    /// axis deltas (15.0 = one wheel detent, negatives scroll up/left) plus
     /// `wl_pointer.axis_v120` for clients that want discrete steps).
     pub fn scroll_pointer(&self, x: f64, y: f64) -> Result<Reply<()>> {
         self.request(|reply| Command::PointerScroll { x, y, reply })
@@ -302,6 +376,148 @@ impl CompositorHandle {
     /// toplevels.
     pub fn focus_window(&self, id: WindowId) -> Result<Reply<()>> {
         self.request(|reply| Command::FocusWindow { id, reply })
+    }
+
+    /// Captures a window's complete surface tree into an RGBA frame.
+    ///
+    /// The capture is occlusion-free: the window is composited on its own,
+    /// including subsurfaces and child popups, regardless of overlap or
+    /// off-screen placement on the virtual output.
+    pub fn capture_window(&self, id: WindowId) -> Result<Reply<Frame>> {
+        self.request(|reply| Command::CaptureWindow { id, reply })
+    }
+
+    /// [`capture_window`](Self::capture_window) encoded as PNG.
+    pub fn capture_window_png(&self, id: WindowId) -> Result<Reply<Vec<u8>>> {
+        self.capture_window(id)?.try_map(|frame| frame.encode_png())
+    }
+
+    /// [`capture_window`](Self::capture_window) encoded as lossless WebP.
+    pub fn capture_window_webp(&self, id: WindowId) -> Result<Reply<Vec<u8>>> {
+        self.capture_window(id)?
+            .try_map(|frame| frame.encode_webp())
+    }
+
+    /// Lists all registered virtual outputs with their advertised mode,
+    /// scale and logical geometry.
+    pub fn outputs(&self) -> Result<Reply<Vec<OutputInfo>>> {
+        self.request(|reply| Command::Outputs { reply })
+    }
+
+    /// Adds a virtual output, or reconfigures the existing one named
+    /// `spec.name`.
+    ///
+    /// New outputs advertise a `wl_output` global (mode, scale and
+    /// `zxdg_output_v1` logical geometry) and are mapped into compositor
+    /// space at `spec.position`. Updates push the changed attributes to
+    /// every bound `wl_output` and re-publish scale hints to surfaces
+    /// overlapping the output. Invalid specs are rejected with
+    /// [`Error::InvalidOutputSpec`].
+    pub fn update_output(&self, spec: OutputSpec) -> Result<Reply<()>> {
+        self.request(|reply| Command::UpdateOutput { spec, reply })
+    }
+
+    /// Removes the virtual output named `name`, withdrawing its
+    /// `wl_output` global (`wl_registry.global_remove`) and unmapping it
+    /// from compositor space.
+    ///
+    /// Unknown names return [`Error::UnknownOutput`]; removing the last
+    /// remaining output is rejected with [`Error::InvalidOutputSpec`].
+    pub fn remove_output(&self, name: &str) -> Result<Reply<()>> {
+        self.request(|reply| Command::RemoveOutput {
+            name: name.to_string(),
+            reply,
+        })
+    }
+
+    /// Captures a whole virtual output: all visible windows composited in
+    /// z-order over an opaque black background at the output's physical
+    /// (mode) pixel resolution.
+    ///
+    /// `name` is the `wl_output` name (the built-in virtual output is
+    /// `"Virtual-1"`); unknown names return [`Error::UnknownOutput`].
+    pub fn capture_output(&self, name: &str) -> Result<Reply<Frame>> {
+        self.request(|reply| Command::CaptureOutput {
+            name: name.to_string(),
+            reply,
+        })
+    }
+
+    /// [`capture_output`](Self::capture_output) encoded as PNG.
+    pub fn capture_output_png(&self, name: &str) -> Result<Reply<Vec<u8>>> {
+        self.capture_output(name)?
+            .try_map(|frame| frame.encode_png())
+    }
+
+    /// [`capture_output`](Self::capture_output) encoded as lossless WebP.
+    pub fn capture_output_webp(&self, name: &str) -> Result<Reply<Vec<u8>>> {
+        self.capture_output(name)?
+            .try_map(|frame| frame.encode_webp())
+    }
+
+    /// Switches the virtual frame clock between [`FrameClockMode::Realtime`]
+    /// (60Hz cadence, the default) and [`FrameClockMode::Paused`] (callbacks
+    /// held until [`Self::step_frame_clock`] advances the clock).
+    ///
+    /// The virtual presentation clock is never reset, so `wl_callback.done`
+    /// timestamps stay monotonic across mode switches.
+    pub fn set_frame_clock_mode(&self, mode: FrameClockMode) -> Result<Reply<()>> {
+        self.request(|reply| Command::SetFrameClockMode { mode, reply })
+    }
+
+    /// Advances the virtual frame clock by `duration`, firing every pending
+    /// `wl_surface.frame` callback once with the stepped presentation
+    /// timestamp.
+    ///
+    /// This is the deterministic counterpart to realtime mode for tests:
+    /// while paused, clients' animations advance exactly one step per call.
+    /// Stepping while realtime is also allowed and simply injects an extra
+    /// advancement on top of the regular ticks.
+    pub fn step_frame_clock(&self, duration: Duration) -> Result<Reply<()>> {
+        self.request(|reply| Command::StepFrameClock { duration, reply })
+    }
+
+    /// Installs a compositor-provided selection.
+    ///
+    /// Clients holding keyboard/selection focus are offered `mime` and receive
+    /// `data` when they request it. Replaces the current `kind` selection and
+    /// emits [`CompositorEvent::ClipboardUpdated`].
+    pub fn set_selection(
+        &self,
+        kind: SelectionKind,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Reply<()>> {
+        self.request(|reply| Command::SetSelection {
+            kind,
+            mime,
+            data,
+            reply,
+        })
+    }
+
+    /// Clears the current `kind` selection.
+    ///
+    /// Clients are notified their offer is gone and a
+    /// [`CompositorEvent::ClipboardUpdated`] with empty `mime_types` is emitted.
+    pub fn clear_selection(&self, kind: SelectionKind) -> Result<Reply<()>> {
+        self.request(|reply| Command::ClearSelection { kind, reply })
+    }
+
+    /// Reads the current `kind` selection negotiated to `mime`.
+    ///
+    /// Returns the exact bytes the owning client (or the compositor's own
+    /// store, for selections installed via [`Self::set_selection`]) supplies.
+    /// Fails with [`Error::EmptySelection`] when nothing is set and
+    /// [`Error::MimeTypeNotOffered`] when `mime` is not among the offered
+    /// types — neither hangs the compositor event loop.
+    pub fn read_selection(&self, kind: SelectionKind, mime: String) -> Result<Reply<Vec<u8>>> {
+        self.request(|reply| Command::ReadSelection { kind, mime, reply })
+    }
+
+    /// The MIME types the current `kind` selection offers; empty when unset.
+    pub fn selection_mime_types(&self, kind: SelectionKind) -> Result<Reply<Vec<String>>> {
+        self.request(|reply| Command::SelectionMimeTypes { kind, reply })
     }
 
     /// Shuts the compositor down: the event loop stops, all clients are

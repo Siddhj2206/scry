@@ -479,7 +479,7 @@ fn popup_grab_routes_pointer_and_dismisses_on_outside_click() {
     handle
         .press_pointer_button(scry::input::PointerButton::Left)
         .unwrap();
-    client.pump_until(|s| s.popup_done);
+    client.pump_until(|s| s.popup_done > 0);
 
     // After the grab ended, a subsequent click reaches the parent surface.
     handle

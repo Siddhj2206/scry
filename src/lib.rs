@@ -9,10 +9,15 @@
 //! │   CompositorHandle   │ commands │  smithay protocol state       │
 //! │   · windows()        │─────────▶│  · wl_compositor/subcompositor│
 //! │   · resize/close     │          │  · wl_shm                     │
-//! │   · shutdown()       │          │  · xdg_shell (toplevel/popup) │
-//! │                      │          │  · wl_output (virtual)        │
-//! │   subscribe()        │  events  │  · Space + PopupManager       │
-//! │   ◀───────────────── │◀─────────│  · SO_PEERCRED pid registry   │
+//! │   · set/read         │          │  · xdg_shell (toplevel/popup) │
+//! │     selection        │          │    + xdg_decoration           │
+//! │   · update_output    │          │  · wl_output (virtual) +      │
+//! │   · shutdown()       │          │    wp_viewporter +            │
+//! │                      │          │    wp_fractional_scale_v1     │
+//! │   subscribe()        │  events  │  · wl_seat + clipboard        │
+//! │   ◀───────────────── │◀─────────│    (wl_data_device + primary) │
+//! │                      │          │  · Space + PopupManager       │
+//! │                      │          │  · SO_PEERCRED pid registry   │
 //! └──────────────────────┘          └────────────▲─────────────────┘
 //!                                                │ real Unix socket
 //!                                          wayland clients
@@ -42,15 +47,24 @@
 //! # }
 //! ```
 
+mod clipboard;
 mod compositor;
 mod error;
 mod event;
+mod frame;
+mod frame_clock;
 mod handle;
 /// Synthetic input types (`wl_seat` pointer/keyboard/text injection).
 pub mod input;
+mod output;
+mod render;
 mod state;
 
+pub use clipboard::SelectionKind;
 pub use compositor::Compositor;
 pub use error::{Error, Result};
-pub use event::{CompositorEvent, Rect, Seq, SurfaceId, WindowId, WindowInfo};
+pub use event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo};
+pub use frame::Frame;
+pub use frame_clock::FrameClockMode;
 pub use handle::{CompositorHandle, Reply};
+pub use output::{OutputInfo, OutputSpec};
