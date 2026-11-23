@@ -5,9 +5,9 @@
 //! correlates every app to compositor windows by exact pid
 //! (`GetConnectionUnixProcessID` ↔ `WindowInfo`'s `SO_PEERCRED` pid, with
 //! frame-name/title matching when one process owns multiple toplevels),
-//! then walks each matched subtree translating `Component` screen extents
-//! into absolute workspace coordinates anchored on the window's
-//! authoritative logical geometry.
+//! then walks each matched subtree translating `Component`
+//! window-relative extents into absolute workspace coordinates anchored
+//! on the window's authoritative logical geometry.
 //!
 //! Snapshots get a monotonic `snapshot_id` and per-node `eN` refs whose
 //! `(bus_name, object_path, role, exact_name)` identity is retained —
@@ -413,8 +413,9 @@ pub struct SubtreeRoot {
     pub role: String,
     /// The node's exact name at snapshot time.
     pub name: String,
-    /// The node's fused bounds at snapshot time — the anchor the
-    /// re-walked subtree is translated onto.
+    /// The node's fused bounds at snapshot time — retained for the
+    /// error context; re-walked nodes anchor on the window's *live*
+    /// geometry instead.
     pub anchor: Option<Rect>,
 }
 
@@ -813,14 +814,17 @@ async fn fuse_group_window(
         return entry;
     }
 
-    // Anchor: the fused root's own screen extents are translated so the
-    // tree lands exactly on the compositor's authoritative geometry.
-    // Toolkits that already report compositor-absolute extents then get a
-    // zero delta; window-relative toolkits get the window origin.
+    // Anchor: the fused root's own window-relative extents are
+    // translated so the tree lands exactly on the compositor's
+    // authoritative geometry — (0,0)-relative roots get the window
+    // origin verbatim, and roots that report a non-zero origin (nested
+    // surfaces) get pinned onto it. A root with no `Component` at all
+    // still descends into window-relative children: anchor those at the
+    // window origin as well.
     let delta = component_extents(conn, &root)
         .await
         .map(|e| (window.geometry.x - e.0, window.geometry.y - e.1))
-        .unwrap_or((0, 0));
+        .unwrap_or((window.geometry.x, window.geometry.y));
 
     let root_node = build_node(conn, &root, delta, ref_counter, budget).await;
     match root_node {
@@ -967,7 +971,7 @@ async fn subtree_capture(
     // Re-check the ref's `(role, exact name)` identity on the live peer
     // — the same `verify_ref` check `click_node`/`node_action` run before
     // acting; stale refs fail before any walking.
-    let live = verify_ref(
+    verify_ref(
         conn,
         &RefTarget {
             window_id: subtree.window_id,
@@ -992,15 +996,12 @@ async fn subtree_capture(
         .map_err(|_| stale(None))?;
     let obj = ObjectRef::new_owned(unique.clone(), path);
 
-    // Anchor on the bounds the snapshot recorded so re-walked coordinates
-    // stay in absolute workspace space (zero delta when nothing moved).
-    let delta = match subtree.anchor {
-        Some(anchor) => live
-            .extents
-            .map(|e| (anchor.x - e.0, anchor.y - e.1))
-            .unwrap_or((0, 0)),
-        None => (0, 0),
-    };
+    // Anchor on the window's *current* compositor geometry: extents are
+    // window-relative, so every re-walked node lands at its true
+    // absolute position — identical to the snapshot's `anchor` while the
+    // window is unmoved, and correctly tracking it when it has moved
+    // since the snapshot.
+    let delta = (window.geometry.x, window.geometry.y);
 
     // Peer provenance for the entry's correlation audit trail.
     let pid = dbus
@@ -1336,7 +1337,7 @@ async fn value_proxy<'a>(
         .ok()
 }
 
-/// `Component::GetExtents` in screen coordinates for `obj`, if the peer
+/// `Component::GetExtents` in window coordinates for `obj`, if the peer
 /// serves the interface and answers.
 async fn component_extents(
     conn: &zbus::Connection,
@@ -1345,9 +1346,17 @@ async fn component_extents(
     extents_at(conn, obj.name_as_str()?, obj.path().as_str()).await
 }
 
-/// `Component::GetExtents` in screen coordinates for the object at
+/// `Component::GetExtents` in window coordinates for the object at
 /// `(bus_name, path)` — the live-bounds refresh behind `click_node`'s
 /// fused-center computation.
+///
+/// Window-relative is the only coordinate space that is meaningful
+/// under a headless Wayland compositor: clients cannot know their
+/// compositor position, so real toolkits report degenerate `Screen`
+/// extents (GTK4 answers `(0, 0, w, h)` for *every* node). With
+/// `CoordType::Window`, a node's extents are relative to its toplevel
+/// surface origin and fuse exactly onto the window's compositor
+/// geometry.
 pub async fn extents_at(
     conn: &zbus::Connection,
     bus_name: &str,
@@ -1364,7 +1373,7 @@ pub async fn extents_at(
         .build()
         .await
         .ok()?;
-    proxy.get_extents(CoordType::Screen).await.ok()
+    proxy.get_extents(CoordType::Window).await.ok()
 }
 
 // -- staleness-checked refs (M3.4) ---------------------------------------------
@@ -1376,7 +1385,7 @@ pub struct LiveNode {
     pub role: String,
     /// The node's current exact name.
     pub name: String,
-    /// Live screen-space extents when the node serves `Component`.
+    /// Live window-relative extents when the node serves `Component`.
     pub extents: Option<(i32, i32, i32, i32)>,
     /// Whether the node lists `org.a11y.atspi.Action`.
     pub has_action: bool,

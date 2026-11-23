@@ -174,6 +174,12 @@ impl ScryState {
                 time: self.now_ms(),
             },
         );
+        // Wayland clients group pointer events by `wl_pointer.frame`:
+        // GTK defers dispatch until a frame closes the batch, so a
+        // press emitted before the frame that carries `enter` lands
+        // against stale pointer state (real GTK4 ignores the first
+        // synthetic click). Frame every batch like real compositors do.
+        pointer.frame(self);
         Ok(())
     }
 
@@ -193,6 +199,7 @@ impl ScryState {
                 },
             },
         );
+        pointer.frame(self);
 
         // Click-to-focus: a press raises + focuses the toplevel owning the
         // surface the pointer is on. Popup grabs may reroute/dismiss first —

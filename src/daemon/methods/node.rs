@@ -319,10 +319,10 @@ async fn click_node(ws: Arc<Workspace>, call: Call) -> Result<Value, ErrorRespon
     }))
 }
 
-/// The node's fused absolute bounds: live screen extents re-anchored on
-/// the window's current compositor geometry (via the fused root's live
-/// extents — the same delta `get_tree` applied at capture), else the
-/// snapshot's fused bounds.
+/// The node's fused absolute bounds: live window-relative extents
+/// re-anchored on the window's current compositor geometry (via the
+/// fused root's live extents — the same delta `get_tree` applied at
+/// capture), else the snapshot's fused bounds.
 async fn fused_bounds(
     conn: &zbus::Connection,
     snapshot: &TreeSnapshot,

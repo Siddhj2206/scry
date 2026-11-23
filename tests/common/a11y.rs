@@ -192,6 +192,9 @@ struct NodeState {
     invoked: Vec<String>,
     /// Once set, every interface method fails like a vanished object.
     removed: bool,
+    /// GTK4-on-Wayland behavior: `CoordType::Screen` extents report
+    /// `(0, 0, w, h)` — clients cannot know their compositor position.
+    degenerate_screen: bool,
 }
 
 impl NodeState {
@@ -322,6 +325,14 @@ impl FakePeer {
     /// `insert_child` at the end of the parent's child list.
     pub fn add_child(&self, parent_path: &str, node: FakeNode) -> String {
         self.insert_child(parent_path, usize::MAX, node)
+    }
+
+    /// Puts the peer in GTK4-on-Wayland mode: `CoordType::Screen`
+    /// extents degenerate to `(0, 0, w, h)` — the real positions are
+    /// only available under `CoordType::Window`/`Parent`.
+    pub fn degenerate_screen(&self, path: &str) {
+        let node = self.node(path);
+        node.lock().unwrap().degenerate_screen = true;
     }
 }
 
@@ -512,6 +523,7 @@ fn serve_one(
                 .collect(),
             invoked: Vec::new(),
             removed: false,
+            degenerate_screen: false,
         }));
         nodes
             .lock()
@@ -730,12 +742,22 @@ impl FakeComponent {
         (String::new(), OwnedObjectPath::try_from(NULL_PATH).unwrap())
     }
 
-    async fn get_extents(&self, _coord_type: u32) -> (i32, i32, i32, i32) {
-        self.state.lock().unwrap().bounds.unwrap_or_default().into()
+    async fn get_extents(&self, coord_type: u32) -> (i32, i32, i32, i32) {
+        let state = self.state.lock().unwrap();
+        let bounds = state.bounds.unwrap_or_default();
+        // CoordType::Screen (0): a degenerate peer reports no position.
+        if coord_type == 0 && state.degenerate_screen {
+            return (0, 0, bounds[2], bounds[3]);
+        }
+        bounds.into()
     }
 
-    async fn get_position(&self, _coord_type: u32) -> (i32, i32) {
-        let bounds = self.state.lock().unwrap().bounds.unwrap_or_default();
+    async fn get_position(&self, coord_type: u32) -> (i32, i32) {
+        let state = self.state.lock().unwrap();
+        let bounds = state.bounds.unwrap_or_default();
+        if coord_type == 0 && state.degenerate_screen {
+            return (0, 0);
+        }
         (bounds[0], bounds[1])
     }
 
