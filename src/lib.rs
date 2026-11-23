@@ -45,10 +45,13 @@
 mod compositor;
 mod error;
 mod event;
+mod frame;
 mod handle;
+mod render;
 mod state;
 
 pub use compositor::Compositor;
 pub use error::{Error, Result};
-pub use event::{CompositorEvent, Rect, Seq, SurfaceId, WindowId, WindowInfo};
+pub use event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo};
+pub use frame::Frame;
 pub use handle::{CompositorHandle, Reply};

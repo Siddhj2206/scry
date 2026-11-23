@@ -42,8 +42,8 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         seat::WaylandFocus,
         shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XDG_TOPLEVEL_ROLE, XdgShellHandler,
-            XdgShellState, XdgToplevelSurfaceData,
+            PopupSurface, PositionerState, ToplevelSurface, XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE,
+            XdgPopupSurfaceData, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -52,8 +52,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     error::Error,
-    event::{CompositorEvent, Rect, Seq, SurfaceId, WindowId, WindowInfo},
+    event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
     handle::{Command, Reply},
+    render,
 };
 
 /// Size of the single virtual output every `Compositor` starts with.
@@ -92,6 +93,12 @@ struct WindowRecord {
     last_info: WindowInfo,
 }
 
+/// A currently mapped `xdg_popup`, keyed by its surface.
+struct PopupRecord {
+    surface_id: SurfaceId,
+    surface: WlSurface,
+}
+
 /// The compositor state owned by the event-loop thread.
 pub(crate) struct ScryState {
     // -- wayland protocol states -------------------------------------------
@@ -116,6 +123,8 @@ pub(crate) struct ScryState {
     pending_toplevels: Vec<ToplevelSurface>,
     /// Currently mapped toplevel windows.
     windows: Vec<WindowRecord>,
+    /// Currently mapped popups (any window's).
+    mapped_popups: Vec<PopupRecord>,
     /// Monotonic event/ack sequence counter.
     seq: Seq,
     next_window_id: u64,
@@ -166,6 +175,7 @@ impl ScryState {
             default_output,
             pending_toplevels: Vec::new(),
             windows: Vec::new(),
+            mapped_popups: Vec::new(),
             seq: 0,
             next_window_id: 1,
             next_surface_id: 1,
@@ -289,9 +299,10 @@ impl ScryState {
             window.on_commit();
         }
 
-        let is_toplevel = get_role(surface) == Some(XDG_TOPLEVEL_ROLE);
-        if is_toplevel {
-            self.on_toplevel_commit(surface);
+        match get_role(surface) {
+            Some(XDG_TOPLEVEL_ROLE) => self.on_toplevel_commit(surface),
+            Some(XDG_POPUP_ROLE) => self.on_popup_commit(surface),
+            _ => {}
         }
 
         // Damage committed with this commit, normalized to buffer coordinates.
@@ -401,6 +412,82 @@ impl ScryState {
         self.emit(|seq| CompositorEvent::WindowMapped { seq, window: info });
     }
 
+    /// Maps / unmaps an `xdg_popup` following a commit.
+    fn on_popup_commit(&mut self, surface: &WlSurface) {
+        let has_buffer =
+            with_renderer_surface_state(surface, |rss| rss.buffer().is_some()).unwrap_or(false);
+        let mapped = self
+            .mapped_popups
+            .iter()
+            .position(|record| record.surface == *surface);
+
+        match (has_buffer, mapped) {
+            (true, None) => {
+                let Some(surface_id) = self.surface_id_for(surface) else {
+                    return;
+                };
+                self.mapped_popups.push(PopupRecord {
+                    surface_id,
+                    surface: surface.clone(),
+                });
+                let popup = self.popup_info(surface_id, surface);
+                self.emit(|seq| CompositorEvent::PopupMapped { seq, popup });
+            }
+            (false, Some(pos)) => {
+                let record = self.mapped_popups.remove(pos);
+                self.emit(|seq| CompositorEvent::PopupClosed {
+                    seq,
+                    surface_id: record.surface_id,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// The [`SurfaceId`] assigned to `surface` at creation, if any.
+    fn surface_id_for(&self, surface: &WlSurface) -> Option<SurfaceId> {
+        with_states(surface, |states| {
+            states
+                .data_map
+                .get::<SurfaceMarker>()
+                .map(|marker| marker.id)
+        })
+    }
+
+    /// The external metadata snapshot for a mapped popup.
+    fn popup_info(&self, surface_id: SurfaceId, surface: &WlSurface) -> PopupInfo {
+        let (geometry, parent) = with_states(surface, |states| {
+            let attributes = states
+                .data_map
+                .get::<XdgPopupSurfaceData>()?
+                .lock()
+                .unwrap();
+            Some((attributes.current.geometry, attributes.parent.clone()))
+        })
+        .unwrap_or_default();
+        let window_id = parent.and_then(|parent| self.window_id_for_surface(&parent));
+        PopupInfo {
+            surface_id,
+            window_id,
+            geometry: Rect::from(geometry),
+        }
+    }
+
+    /// A popup is going away; emit `PopupClosed` if it was mapped.
+    fn on_popup_gone(&mut self, surface: &WlSurface) {
+        if let Some(pos) = self
+            .mapped_popups
+            .iter()
+            .position(|record| record.surface == *surface)
+        {
+            let record = self.mapped_popups.remove(pos);
+            self.emit(|seq| CompositorEvent::PopupClosed {
+                seq,
+                surface_id: record.surface_id,
+            });
+        }
+    }
+
     /// A toplevel is going away, whether it was mapped or still pending.
     fn on_toplevel_gone(&mut self, surface: &WlSurface) {
         self.pending_toplevels
@@ -425,8 +512,10 @@ impl ScryState {
     /// client disconnects; [`XdgShellHandler::toplevel_destroyed`] covers the
     /// orderly path).
     fn on_surface_destroyed(&mut self, surface: &WlSurface) {
-        if get_role(surface) == Some(XDG_TOPLEVEL_ROLE) {
-            self.on_toplevel_gone(surface);
+        match get_role(surface) {
+            Some(XDG_TOPLEVEL_ROLE) => self.on_toplevel_gone(surface),
+            Some(XDG_POPUP_ROLE) => self.on_popup_gone(surface),
+            _ => {}
         }
     }
 
@@ -488,6 +577,29 @@ impl ScryState {
                         let _ = reply.send(Err(Error::UnknownWindow(id)));
                     }
                 }
+            }
+            Command::CaptureWindow { id, reply } => {
+                let outcome = self
+                    .windows
+                    .iter()
+                    .find(|record| record.id == id)
+                    .ok_or(Error::UnknownWindow(id))
+                    .and_then(|record| render::render_window(&record.window));
+                let _ = reply.send(outcome.map(|frame| Reply {
+                    seq: self.seq,
+                    value: frame,
+                }));
+            }
+            Command::CaptureOutput { name, reply } => {
+                let outcome = if name == self.default_output.name() {
+                    render::render_output(&self.space, &self.default_output)
+                } else {
+                    Err(Error::UnknownOutput(name))
+                };
+                let _ = reply.send(outcome.map(|frame| Reply {
+                    seq: self.seq,
+                    value: frame,
+                }));
             }
         }
         // Commands may have produced protocol traffic (configures, closes).
@@ -590,6 +702,10 @@ impl XdgShellHandler for ScryState {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.on_toplevel_gone(surface.wl_surface());
+    }
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.on_popup_gone(surface.wl_surface());
     }
 }
 
