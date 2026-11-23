@@ -420,6 +420,10 @@ fn identical_place_sequences_produce_identical_geometry_and_captures() {
             "capture_window",
             json!({"workspace": ws, "window": id, "format": "png"}),
         );
+        let capture_window_webp = rpc.call(
+            "capture_window",
+            json!({"workspace": ws, "window": id, "format": "webp"}),
+        );
         let capture_ws = rpc.call(
             "capture_workspace",
             json!({"workspace": ws, "format": "png"}),
@@ -431,6 +435,7 @@ fn identical_place_sequences_produce_identical_geometry_and_captures() {
         results.push((
             listed["windows"][0]["geometry"].clone(),
             capture_window["data"].clone(),
+            capture_window_webp["data"].clone(),
             capture_ws["data"].clone(),
             capture_ws_webp["data"].clone(),
         ));
