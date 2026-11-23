@@ -32,6 +32,7 @@ fn spawn_daemon() -> TestDaemon {
         state_dir: state_dir.clone(),
         default_idle_ttl: Duration::from_secs(300),
         reaper_interval: Duration::from_millis(25),
+        change_log_capacity: scry::daemon::DEFAULT_CHANGE_LOG_CAPACITY,
     };
     let handle = DaemonHandle::spawn(config).expect("daemon failed to start");
     TestDaemon {
