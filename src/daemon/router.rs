@@ -52,6 +52,7 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::output::ADD,
     crate::daemon::methods::output::LIST,
     crate::daemon::methods::output::REMOVE,
+    crate::daemon::methods::spawn::SPAWN_APP,
     crate::daemon::methods::windows::LIST_WINDOWS,
     crate::daemon::methods::windows::PLACE_WINDOW,
     crate::daemon::methods::windows::CAPTURE_WINDOW,

@@ -657,6 +657,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "signal-hook",
