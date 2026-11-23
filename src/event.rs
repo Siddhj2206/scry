@@ -92,6 +92,25 @@ pub struct PopupInfo {
     pub geometry: Rect,
 }
 
+/// One retained damage record: the normalized buffer-space rectangles a
+/// `wl_surface` commit damaged, stamped with the seq of its
+/// [`CompositorEvent::SurfaceCommitted`] event.
+///
+/// The compositor keeps a bounded log of these (see
+/// [`CompositorHandle::damage_since`](crate::CompositorHandle::damage_since))
+/// so callers can diff regions without re-capturing frames.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DamageEntry {
+    /// Sequence number of the `SurfaceCommitted` event that produced it.
+    pub seq: Seq,
+    /// The `wl_surface` that committed the damage.
+    pub surface_id: SurfaceId,
+    /// The window the surface belonged to at commit time, if any.
+    pub window_id: Option<WindowId>,
+    /// Damaged regions, normalized to buffer coordinates.
+    pub damage: Vec<Rect>,
+}
+
 /// An event emitted by the compositor on its ordered event stream.
 ///
 /// New variants are added as scry gains capabilities (popups, clipboard,

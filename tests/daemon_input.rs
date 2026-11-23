@@ -409,6 +409,15 @@ fn window_local_click_hits_covered_windows() {
     let top = client.map_toplevel(100, 100, "org.scry.Top", "Top");
     client.roundtrip();
 
+    // New windows cascade to distinct slots (M2.2), so stack `top` over
+    // `bottom` explicitly: `place_window` moves without raising, leaving
+    // `top` (mapped later) on top.
+    rpc.call(
+        "place_window",
+        json!({"workspace": "local", "window": 2, "x": 0, "y": 0}),
+    );
+    client.roundtrip();
+
     // Output coordinates hit the topmost window (`top` covers `bottom`).
     rpc.call("click", json!({"workspace": "local", "x": 10.0, "y": 10.0}));
     client.pump_until(|s| !s.pointer_enters.is_empty());

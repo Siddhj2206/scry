@@ -59,6 +59,11 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::input::KEY_COMBO,
     crate::daemon::methods::input::CLIPBOARD_GET,
     crate::daemon::methods::input::CLIPBOARD_SET,
+    crate::daemon::methods::windows::LIST_WINDOWS,
+    crate::daemon::methods::windows::PLACE_WINDOW,
+    crate::daemon::methods::windows::CAPTURE_WINDOW,
+    crate::daemon::methods::windows::CAPTURE_WORKSPACE,
+    crate::daemon::methods::windows::GET_DAMAGE,
 ];
 
 /// Dispatches one request to its verb and wraps the payload in the standard
