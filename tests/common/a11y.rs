@@ -75,6 +75,20 @@ pub struct FakeNode {
     /// AT-SPI state names to report (`"enabled"`, `"showing"`, ...).
     #[serde(default)]
     pub states: Vec<String>,
+    /// `Text` interface contents — serves `org.a11y.atspi.Text` when set.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// `Value` interface contents `(current, text)` — serves
+    /// `org.a11y.atspi.Value` when set.
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// `Value::Text` answer, when `value` is set.
+    #[serde(default)]
+    pub value_text: Option<String>,
+    /// Milliseconds each `GetChildren` sleeps before answering — a
+    /// deliberately slow peer for deadline/cancellation tests.
+    #[serde(default)]
+    pub delay_ms: u64,
     /// Child nodes.
     #[serde(default)]
     pub children: Vec<FakeNode>,
@@ -88,6 +102,10 @@ impl FakeNode {
             role: role.to_string(),
             bounds: None,
             states: vec!["enabled".into(), "showing".into(), "visible".into()],
+            text: None,
+            value: None,
+            value_text: None,
+            delay_ms: 0,
             children: Vec::new(),
         }
     }
@@ -101,6 +119,30 @@ impl FakeNode {
     /// Sets states.
     pub fn states(mut self, states: &[&str]) -> Self {
         self.states = states.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Gives the node a `Text` interface holding `text`.
+    pub fn text(mut self, text: &str) -> Self {
+        self.text = Some(text.to_string());
+        self
+    }
+
+    /// Gives the node a `Value` interface reading `value`.
+    pub fn value(mut self, value: f64) -> Self {
+        self.value = Some(value);
+        self
+    }
+
+    /// Gives the node's `Value` interface a textual form.
+    pub fn value_text(mut self, text: &str) -> Self {
+        self.value_text = Some(text.to_string());
+        self
+    }
+
+    /// Makes every `GetChildren` call on this node sleep `ms` first.
+    pub fn delay_ms(mut self, ms: u64) -> Self {
+        self.delay_ms = ms;
         self
     }
 
@@ -197,6 +239,12 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
         if node.bounds.is_some() {
             interfaces.push("org.a11y.atspi.Component".to_string());
         }
+        if node.text.is_some() {
+            interfaces.push("org.a11y.atspi.Text".to_string());
+        }
+        if node.value.is_some() {
+            interfaces.push("org.a11y.atspi.Value".to_string());
+        }
         let role = role_value(&node.role);
         conn.object_server()
             .at(
@@ -215,6 +263,7 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
                     children,
                     child_count: node.children.len() as i32,
                     interfaces,
+                    delay: Duration::from_millis(node.delay_ms),
                 },
             )
             .unwrap_or_else(|e| panic!("failed to serve {path}: {e}"));
@@ -222,6 +271,22 @@ pub fn serve(addr: &str, root: &FakeNode) -> FakePeer {
             conn.object_server()
                 .at(path.as_str(), FakeComponent { bounds })
                 .unwrap_or_else(|e| panic!("failed to serve {path} component: {e}"));
+        }
+        if let Some(text) = &node.text {
+            conn.object_server()
+                .at(path.as_str(), FakeText { text: text.clone() })
+                .unwrap_or_else(|e| panic!("failed to serve {path} text: {e}"));
+        }
+        if let Some(value) = node.value {
+            conn.object_server()
+                .at(
+                    path.as_str(),
+                    FakeValue {
+                        current: value,
+                        text: node.value_text.clone().unwrap_or_default(),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("failed to serve {path} value: {e}"));
         }
     }
 
@@ -301,11 +366,16 @@ struct FakeAccessible {
     children: Vec<(String, OwnedObjectPath)>,
     child_count: i32,
     interfaces: Vec<String>,
+    /// How long `GetChildren` sleeps before answering (slow-peer tests).
+    delay: Duration,
 }
 
 #[zbus::interface(name = "org.a11y.atspi.Accessible")]
 impl FakeAccessible {
     async fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         self.children.clone()
     }
 
@@ -453,6 +523,68 @@ impl FakeComponent {
 
     async fn set_size(&self, _width: i32, _height: i32) -> bool {
         false
+    }
+}
+
+/// `org.a11y.atspi.Text` implementation for nodes carrying `text`.
+struct FakeText {
+    text: String,
+}
+
+#[zbus::interface(name = "org.a11y.atspi.Text")]
+impl FakeText {
+    async fn get_text(&self, start_offset: i32, end_offset: i32) -> String {
+        let start = start_offset.max(0) as usize;
+        let end = (end_offset.max(0) as usize).min(self.text.chars().count());
+        self.text
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect()
+    }
+
+    #[zbus(property)]
+    async fn character_count(&self) -> i32 {
+        self.text.chars().count() as i32
+    }
+
+    #[zbus(property)]
+    async fn caret_offset(&self) -> i32 {
+        0
+    }
+}
+
+/// `org.a11y.atspi.Value` implementation for nodes carrying `value`.
+struct FakeValue {
+    current: f64,
+    text: String,
+}
+
+#[zbus::interface(name = "org.a11y.atspi.Value")]
+impl FakeValue {
+    #[zbus(property)]
+    async fn current_value(&self) -> f64 {
+        self.current
+    }
+
+    #[zbus(property)]
+    async fn minimum_value(&self) -> f64 {
+        0.0
+    }
+
+    #[zbus(property)]
+    async fn maximum_value(&self) -> f64 {
+        100.0
+    }
+
+    #[zbus(property)]
+    async fn minimum_increment(&self) -> f64 {
+        1.0
+    }
+
+    #[zbus(property)]
+    async fn text(&self) -> String {
+        self.text.clone()
     }
 }
 

@@ -510,7 +510,20 @@ struct TreeArgs {
     /// Restrict the snapshot to one window id.
     #[arg(long)]
     window: Option<u64>,
-    /// Bound the a11y capture in milliseconds.
+    /// Restrict the snapshot to one previously snapshotted node ref
+    /// (e.g. "e12") — drills into a subtree.
+    #[arg(long, value_name = "REF")]
+    root_ref: Option<String>,
+    /// Maximum descent depth (default 64); cut branches get an inline
+    /// `- ... depth limit reached` note.
+    #[arg(long, value_name = "N")]
+    max_depth: Option<u64>,
+    /// Maximum nodes emitted (default 10000); cut branches get an inline
+    /// `- ... node limit reached` note.
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<u64>,
+    /// Bound the a11y capture in milliseconds; open branches degrade
+    /// into `- ... deadline exceeded` notes.
     #[arg(long, value_name = "MS")]
     deadline_ms: Option<u64>,
 }
@@ -969,6 +982,15 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
             let mut params = ws(&args.workspace);
             if let Some(window) = args.window {
                 params["window_id"] = json!(window);
+            }
+            if let Some(root_ref) = &args.root_ref {
+                params["root_ref"] = json!(root_ref);
+            }
+            if let Some(depth) = args.max_depth {
+                params["max_depth"] = json!(depth);
+            }
+            if let Some(nodes) = args.max_nodes {
+                params["max_nodes"] = json!(nodes);
             }
             if let Some(ms) = args.deadline_ms {
                 params["deadline_ms"] = json!(ms);

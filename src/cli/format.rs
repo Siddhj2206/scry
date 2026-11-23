@@ -519,6 +519,16 @@ fn format_tree(r: &Value) -> String {
     if let Some(seq) = r["seq"].as_u64() {
         out.push_str(&format!(" (seq {seq})"));
     }
+    if let Some(node_ref) = r["root_ref"].as_str() {
+        out.push_str(&format!(" scoped to {node_ref}"));
+    }
+    let tripped: Vec<&str> = r["truncation"]["tripped"]
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !tripped.is_empty() {
+        out.push_str(&format!(" truncated: {}", tripped.join(",")));
+    }
     let Some(windows) = r["windows"].as_array() else {
         out.push_str("\nno windows");
         return out;
@@ -560,30 +570,53 @@ fn format_tree_window(w: &Value) -> String {
     if let Some(hint) = w["hint"].as_str() {
         line.push_str(&format!(" [{hint}]"));
     }
+    if let Some(note) = w.pointer("/truncated/note").and_then(Value::as_str) {
+        line.push_str(&format!("\n  {note}"));
+    }
     if let Some(root) = w.get("root").and_then(|r| r.as_object()) {
         format_tree_node(&Value::Object(root.clone()), 0, &mut line);
     }
     line
 }
 
-/// One indented canonical tree line per node, depth-first.
+/// One indented canonical tree line per node, depth-first, with
+/// `text=`/`value=` fields and `- ... <reason>` markers for cut branches.
 fn format_tree_node(node: &Value, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth + 1);
     let bounds = node["bounds"]
         .as_object()
         .map(|b| format!(" ({},{ } {}x{})", b["x"], b["y"], b["width"], b["height"]))
         .unwrap_or_default();
+    let text = node["text"]
+        .as_str()
+        .map(|t| format!(" text={t:?}"))
+        .unwrap_or_default();
+    let value = node
+        .get("value")
+        .filter(|v| !v.is_null())
+        .map(|v| format!(" value={v}"))
+        .unwrap_or_default();
+    let value_text = node["value_text"]
+        .as_str()
+        .map(|t| format!(" value_text={t:?}"))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "\n{indent}[{}] {} {:?}{}",
+        "\n{indent}[{}] {} {:?}{}{}{}{}",
         node["ref"].as_str().unwrap_or("?"),
         node["role"].as_str().unwrap_or("?"),
         node["name"].as_str().unwrap_or(""),
         bounds,
+        text,
+        value,
+        value_text,
     ));
     if let Some(children) = node["children"].as_array() {
         for child in children {
             format_tree_node(child, depth + 1, out);
         }
+    }
+    if let Some(note) = node.pointer("/truncated/note").and_then(Value::as_str) {
+        out.push_str(&format!("\n{indent}  {note}"));
     }
 }
 

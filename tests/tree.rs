@@ -538,6 +538,604 @@ fn get_tree_reports_empty_root() {
     assert!(w["hint"].as_str().unwrap().contains("capture_window"));
 }
 
+/// `max_depth` stops descending branches past the cap: nodes at the cap
+/// that still had children carry a structured `truncated` marker whose
+/// note is the inline `- ... depth limit reached` line, and the
+/// response-level `truncation` block reports `depth` as tripped.
+#[test]
+fn get_tree_max_depth_marks_truncated_branches() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "deep", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "deep",
+        &mut client,
+        "org.scry.Deep",
+        "Deep Win",
+        400,
+        300,
+    );
+
+    // A 4-level tree: frame → panel → box → button.
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Deep Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .child(
+                FakeNode::new("panel", "panel")
+                    .child(FakeNode::new("box", "filler").child(FakeNode::new("OK", "button"))),
+            ),
+    );
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    let tree = rpc.call("get_tree", json!({"workspace": "deep", "max_depth": 2}));
+    assert_eq!(tree["limits"]["max_depth"], 2);
+    assert!(
+        tree["truncation"]["tripped"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("depth")),
+        "truncation summary: {}",
+        tree["truncation"]
+    );
+    assert!(tree["truncation"]["markers"].as_u64().unwrap() >= 1);
+
+    let root = &tree["windows"][0]["root"];
+    assert_eq!(root["name"], "Deep Win");
+    // Depth 1 = frame, depth 2 = panel: the panel had children but could
+    // not be descended.
+    let panel = &root["children"][0];
+    assert_eq!(panel["name"], "panel");
+    assert_eq!(panel["truncated"]["reason"], "depth");
+    assert_eq!(panel["truncated"]["note"], "- ... depth limit reached");
+    assert!(
+        panel["children"].is_null() || panel["children"].as_array().unwrap().is_empty(),
+        "truncated node must not emit children: {panel}"
+    );
+}
+
+/// `scry tree` renders inline `- ... <reason>` markers for truncated
+/// branches.
+#[test]
+fn cli_tree_depth_limit_marker() {
+    let daemon = spawn_daemon();
+    let socket = &daemon.socket_path;
+    let mut rpc = RpcClient::connect(socket);
+    let (ws, wl_socket) = create_workspace(&mut rpc, "cli-depth", json!({}));
+    let mut client = TestClient::connect(&wl_socket);
+    map_window(
+        &mut rpc,
+        "cli-depth",
+        &mut client,
+        "org.scry.CliDepth",
+        "Depth Win",
+        400,
+        300,
+    );
+
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Depth Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .child(FakeNode::new("panel", "panel").child(FakeNode::new("OK", "button"))),
+    );
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scry"))
+        .arg("--socket")
+        .arg(socket)
+        .args(["tree", "-w", "cli-depth", "--max-depth", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "scry tree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("- ... depth limit reached"),
+        "expected inline depth marker: {text}"
+    );
+    assert!(!text.contains("OK"), "cut children must not render: {text}");
+}
+
+/// `max_nodes` bounds total emitted nodes capture-wide: the walk stops
+/// at the budget, every open branch carrying unread children gets a
+/// `- ... node limit reached` marker, and `nodes_emitted` reports the
+/// count actually emitted.
+#[test]
+fn get_tree_max_nodes_marks_and_counts() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "wide", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "wide",
+        &mut client,
+        "org.scry.Wide",
+        "Wide Win",
+        400,
+        300,
+    );
+
+    // frame → 4 panel children, each with a button leaf (10 nodes total
+    // below the application root).
+    let mut frame = FakeNode::new("Wide Win", "frame").bounds([0, 0, 400, 300]);
+    for i in 0..4 {
+        frame = frame.child(
+            FakeNode::new(&format!("panel {i}"), "panel")
+                .child(FakeNode::new(&format!("btn {i}"), "button")),
+        );
+    }
+    let tree = FakeNode::new("fake-app", "application").child(frame);
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    // Emit exactly the frame + one panel (2 nodes): the panel's button
+    // child and the frame's remaining panels are all cut.
+    let tree = rpc.call("get_tree", json!({"workspace": "wide", "max_nodes": 2}));
+    assert_eq!(tree["limits"]["max_nodes"], 2);
+    let truncation = &tree["truncation"];
+    assert!(
+        truncation["tripped"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("nodes"))
+    );
+    assert_eq!(truncation["nodes_emitted"], 2);
+    assert_eq!(truncation["markers"], 2);
+
+    // The root emitted one panel child then stopped; every open branch
+    // carrying unread children carries the inline note.
+    let root = &tree["windows"][0]["root"];
+    let children = root["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "root children: {children:?}");
+    assert_eq!(root["truncated"]["reason"], "nodes");
+    assert_eq!(root["truncated"]["note"], "- ... node limit reached");
+    // The panel was read before the budget ran out, but its button child
+    // was never emitted.
+    assert_eq!(children[0]["name"], "panel 0");
+    assert_eq!(children[0]["truncated"]["reason"], "nodes");
+    assert!(
+        children[0]["children"].is_null() || children[0]["children"].as_array().unwrap().is_empty(),
+        "cut node's children must be absent: {}",
+        children[0]
+    );
+
+    // Invalid bound values are rejected.
+    let err = rpc.call_err("get_tree", json!({"workspace": "wide", "max_nodes": 0}));
+    assert_eq!(err.code, -32602, "expected INVALID_PARAMS, got {err:?}");
+    let err = rpc.call_err("get_tree", json!({"workspace": "wide", "max_depth": 0}));
+    assert_eq!(err.code, -32602, "expected INVALID_PARAMS, got {err:?}");
+}
+
+/// `deadline_ms` turns a deliberately slow peer's unfinished branches
+/// into `- ... deadline exceeded` markers instead of an error, and the
+/// daemon stays responsive afterwards.
+#[test]
+fn get_tree_deadline_marks_partial_tree() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "slow", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "slow",
+        &mut client,
+        "org.scry.Slow",
+        "Slow Win",
+        400,
+        300,
+    );
+
+    // Every `GetChildren` sleeps 150ms: with a 400ms deadline the walk
+    // gets a couple of nodes deep, then unwinds with deadline markers.
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Slow Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .delay_ms(150)
+            .child(
+                FakeNode::new("a", "panel").delay_ms(150).child(
+                    FakeNode::new("b", "panel")
+                        .delay_ms(150)
+                        .child(FakeNode::new("c", "panel")),
+                ),
+            ),
+    );
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    let start = Instant::now();
+    let tree = rpc.call("get_tree", json!({"workspace": "slow", "deadline_ms": 400}));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "get_tree took {elapsed:?} — the deadline should bound it"
+    );
+    assert_eq!(tree["limits"]["deadline_ms"], 400);
+    assert!(
+        tree["truncation"]["tripped"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("deadline")),
+        "truncation summary: {}",
+        tree["truncation"]
+    );
+    assert!(tree["truncation"]["markers"].as_u64().unwrap() >= 1);
+
+    // The deepest emitted node carries the inline deadline marker; the
+    // never-reached "c" node is absent entirely.
+    let rendered = serde_json::to_string(&tree["windows"]).unwrap();
+    assert!(
+        rendered.contains("- ... deadline exceeded"),
+        "windows: {rendered}"
+    );
+    assert!(!rendered.contains("\"c\""), "windows: {rendered}");
+
+    // The daemon is not wedged: a fresh request answers promptly.
+    let listed = rpc.call("list_windows", json!({"workspace": "slow"}));
+    assert_eq!(listed["windows"].as_array().unwrap().len(), 1);
+}
+
+/// `root_ref` scopes a capture to one previously snapshotted node: the
+/// response holds only that node's window, the node becomes the new
+/// subtree root (`e1`), refs renumber deterministically, and fused
+/// coordinates match the original snapshot's absolute positions.
+#[test]
+fn get_tree_root_ref_drills_into_subtree() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "drill", json!({}));
+    let mut client = TestClient::connect(&socket);
+    let window = map_window(
+        &mut rpc,
+        "drill",
+        &mut client,
+        "org.scry.Drill",
+        "Drill Win",
+        400,
+        300,
+    );
+    let window_id = window["id"].as_u64().unwrap();
+
+    // frame → panel (bounded) → [btn-a, btn-b]; e2 is the panel.
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Drill Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .child(
+                FakeNode::new("panel", "panel")
+                    .bounds([40, 50, 200, 100])
+                    .child(FakeNode::new("btn-a", "button").bounds([10, 20, 60, 20]))
+                    .child(FakeNode::new("btn-b", "button").bounds([10, 50, 60, 20])),
+            ),
+    );
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    let full = rpc.call("get_tree", json!({"workspace": "drill"}));
+    let panel = &full["windows"][0]["root"]["children"][0];
+    assert_eq!(panel["ref"], "e2", "full tree: {full}");
+    let panel_bounds = panel["bounds"].clone();
+    let btn_a_bounds = panel["children"][0]["bounds"].clone();
+
+    let scoped = rpc.call("get_tree", json!({"workspace": "drill", "root_ref": "e2"}));
+    assert_eq!(scoped["root_ref"], "e2");
+    let windows = scoped["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["window_id"].as_u64().unwrap(), window_id);
+    assert_eq!(windows[0]["a11y_status"], "ok");
+
+    let root = &windows[0]["root"];
+    assert_eq!(root["ref"], "e1");
+    assert_eq!(root["name"], "panel");
+    assert_eq!(root["role"], "panel");
+    assert_eq!(
+        root["bounds"], panel_bounds,
+        "subtree root must anchor on its snapshotted bounds"
+    );
+    let children = root["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0]["ref"], "e2");
+    assert_eq!(children[0]["name"], "btn-a");
+    assert_eq!(
+        children[0]["bounds"], btn_a_bounds,
+        "descendants keep absolute coordinates"
+    );
+
+    // The scoped result is itself a snapshot whose refs resolve.
+    assert!(scoped["snapshot_id"].as_u64().unwrap() > full["snapshot_id"].as_u64().unwrap());
+
+    // Unknown ref → STALE_REF with a re-snapshot hint.
+    let err = rpc.call_err("get_tree", json!({"workspace": "drill", "root_ref": "e99"}));
+    assert_eq!(err.code, -32010, "expected STALE_REF, got {err:?}");
+    assert!(err.message.contains("e99"));
+
+    // A ref requested before any snapshot exists fails the same way.
+    let fresh = create_workspace(&mut rpc, "drill-fresh", json!({})).0;
+    let _ = fresh;
+    let err = rpc.call_err(
+        "get_tree",
+        json!({"workspace": "drill-fresh", "root_ref": "e1"}),
+    );
+    assert_eq!(err.code, -32010, "expected STALE_REF, got {err:?}");
+}
+
+/// A `root_ref` whose node changed since its snapshot — the peer went
+/// away — fails with `STALE_REF` rather than walking blindly.
+#[test]
+fn get_tree_root_ref_fails_when_node_is_gone() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "stale", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "stale",
+        &mut client,
+        "org.scry.Stale",
+        "Stale Win",
+        400,
+        300,
+    );
+
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let peer = a11y::serve(a11y_addr, &app_tree(&[("Stale Win", "OK")]));
+    let full = rpc.call("get_tree", json!({"workspace": "stale"}));
+    assert_eq!(full["windows"][0]["a11y_status"], "ok");
+
+    // The peer exits: the ref's bus name no longer resolves.
+    drop(peer);
+
+    let err = rpc.call_err("get_tree", json!({"workspace": "stale", "root_ref": "e2"}));
+    assert_eq!(err.code, -32010, "expected STALE_REF, got {err:?}");
+}
+
+/// `scry tree --root-ref` drills into a subtree captured by a prior
+/// snapshot.
+#[test]
+fn cli_tree_root_ref() {
+    let daemon = spawn_daemon();
+    let socket = &daemon.socket_path;
+    let mut rpc = RpcClient::connect(socket);
+    let (ws, wl_socket) = create_workspace(&mut rpc, "cli-ref", json!({}));
+    let mut client = TestClient::connect(&wl_socket);
+    map_window(
+        &mut rpc,
+        "cli-ref",
+        &mut client,
+        "org.scry.CliRef",
+        "Ref Win",
+        400,
+        300,
+    );
+
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Ref Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .child(
+                FakeNode::new("panel", "panel")
+                    .child(FakeNode::new("btn-a", "button"))
+                    .child(FakeNode::new("btn-b", "button")),
+            ),
+    );
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    let run = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_scry"))
+            .arg("--socket")
+            .arg(socket)
+            .args(args)
+            .output()
+            .expect("failed to run scry")
+    };
+
+    // First snapshot establishes the refs, then --root-ref drills in.
+    assert!(run(&["tree", "-w", "cli-ref"]).status.success());
+    let out = run(&["tree", "-w", "cli-ref", "--root-ref", "e2"]);
+    assert!(
+        out.status.success(),
+        "scry tree --root-ref failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("panel"), "scoped output: {text}");
+    assert!(text.contains("btn-a"), "scoped output: {text}");
+
+    // A stale ref surfaces the structured error on stderr.
+    let out = run(&["tree", "-w", "cli-ref", "--root-ref", "e99"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("e99"), "stderr: {stderr}");
+}
+
+/// `Text`/`Value` interfaces surface their contents on emitted nodes —
+/// and a `ROLE_PASSWORD_TEXT` node never exposes its secret: text, value
+/// and value_text are all replaced by the `[REDACTED]` sentinel, in JSON
+/// and in `scry tree` output.
+#[test]
+fn get_tree_extracts_text_and_value_and_redacts_passwords() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "secrets", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "secrets",
+        &mut client,
+        "org.scry.Secrets",
+        "Secret Win",
+        400,
+        300,
+    );
+
+    let secret = "hunter2-correct-horse";
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Secret Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .child(FakeNode::new("user", "entry").text("sid@example.com"))
+            .child(
+                FakeNode::new("volume", "slider")
+                    .value(0.42)
+                    .value_text("42%"),
+            )
+            .child(
+                FakeNode::new("Password", "password text")
+                    .text(secret)
+                    .value(21.0)
+                    .value_text(secret),
+            ),
+    );
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    let tree = rpc.call("get_tree", json!({"workspace": "secrets"}));
+    let rendered = serde_json::to_string(&tree).unwrap();
+    assert!(
+        !rendered.contains(secret),
+        "the secret must never appear in the snapshot: {rendered}"
+    );
+
+    let children = tree["windows"][0]["root"]["children"].as_array().unwrap();
+    let entry = &children[0];
+    assert_eq!(entry["role"], "entry");
+    assert_eq!(entry["text"], "sid@example.com");
+    assert!(entry["redacted"].is_null() || entry["redacted"] == false);
+
+    let slider = &children[1];
+    assert_eq!(slider["value"], 0.42);
+    assert_eq!(slider["value_text"], "42%");
+
+    let password = &children[2];
+    assert_eq!(password["role"], "password text");
+    assert_eq!(password["name"], "Password");
+    assert_eq!(password["redacted"], true);
+    assert_eq!(password["text"], "[REDACTED]");
+    assert_eq!(password["value"], "[REDACTED]");
+    assert_eq!(password["value_text"], "[REDACTED]");
+
+    // `scry tree` shows the sentinel too, and never the secret.
+    let out = Command::new(env!("CARGO_BIN_EXE_scry"))
+        .arg("--socket")
+        .arg(&daemon.socket_path)
+        .args(["tree", "-w", "secrets"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains(secret), "cli leaked secret: {text}");
+    assert!(text.contains("[REDACTED]"), "cli output: {text}");
+    assert!(text.contains("sid@example.com"), "cli output: {text}");
+}
+
+/// Death of a `client_pid` (or the `SO_PEERCRED` peer) aborts an
+/// in-flight capture with `CANCELLED` — a slow peer can't pin a request
+/// whose caller is gone.
+#[test]
+fn get_tree_cancelled_when_client_pid_exits() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "cancel", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "cancel",
+        &mut client,
+        "org.scry.Cancel",
+        "Cancel Win",
+        400,
+        300,
+    );
+
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Cancel Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .delay_ms(500)
+            .child(FakeNode::new("a", "panel").delay_ms(500)),
+    );
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    // A caller-tagged process whose death cancels the capture.
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("failed to spawn sleep");
+    rpc.send_request(
+        "get_tree",
+        json!({"workspace": "cancel", "client_pid": child.id()}),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let frame = rpc.read_frame();
+    let error = &frame["error"];
+    assert_eq!(error["code"], -32007, "expected CANCELLED, got {frame}");
+    assert!(
+        error["message"].as_str().unwrap().contains("client_pid"),
+        "message: {error}"
+    );
+
+    // The daemon stays healthy and answers promptly.
+    let listed = rpc.call("list_windows", json!({"workspace": "cancel"}));
+    assert_eq!(listed["windows"].as_array().unwrap().len(), 1);
+}
+
+/// Dropping the control socket mid-capture aborts traversal: the daemon
+/// keeps answering other connections promptly.
+#[test]
+fn get_tree_cancelled_on_disconnect() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "disc", json!({}));
+    let mut client = TestClient::connect(&socket);
+    map_window(
+        &mut rpc,
+        "disc",
+        &mut client,
+        "org.scry.Disc",
+        "Disc Win",
+        400,
+        300,
+    );
+
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let tree = FakeNode::new("fake-app", "application").child(
+        FakeNode::new("Disc Win", "frame")
+            .bounds([0, 0, 400, 300])
+            .delay_ms(500)
+            .child(FakeNode::new("a", "panel").delay_ms(500)),
+    );
+    let _peer = a11y::serve(a11y_addr, &tree);
+
+    {
+        let mut gone = RpcClient::connect(&daemon.socket_path);
+        gone.send_request("get_tree", json!({"workspace": "disc"}));
+        std::thread::sleep(Duration::from_millis(100));
+        drop(gone); // full disconnect cancels the in-flight capture
+    }
+
+    // The capture's dead caller never wedges the daemon: this connection
+    // gets a fresh, complete answer right away.
+    let start = Instant::now();
+    let listed = rpc.call("list_windows", json!({"workspace": "disc"}));
+    assert_eq!(listed["windows"].as_array().unwrap().len(), 1);
+    let tree = rpc.call(
+        "get_tree",
+        json!({"workspace": "disc", "deadline_ms": 5000}),
+    );
+    assert_eq!(tree["windows"][0]["a11y_status"], "ok", "tree: {tree}");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "daemon appears wedged after disconnect"
+    );
+}
+
 /// `scry tree` renders the fused snapshot in compact human form and in
 /// `--json`.
 #[test]

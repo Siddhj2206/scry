@@ -448,6 +448,16 @@ impl Workspace {
             .cloned()
     }
 
+    /// The most recent `get_tree` snapshot, if any — the snapshot
+    /// `get_tree`'s `root_ref` resolves against by default.
+    pub fn latest_tree_snapshot(&self) -> Option<a11y::TreeSnapshot> {
+        self.tree_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .latest()
+            .cloned()
+    }
+
     /// The workspace's scripted portal stub — scripting queue, invocation
     /// history and health (`portal_*` verbs, `status`).
     pub fn portal(&self) -> &PortalManager {

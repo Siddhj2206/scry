@@ -17,10 +17,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     CompositorEvent, Seq, WindowId, WindowInfo,
     daemon::{
-        now_ms,
+        LIVENESS_INTERVAL, now_ms, pid_alive,
         protocol::{ErrorResponse, code},
         registry::{Workspace, commit_seq},
         router::{Call, MethodDef, Scope},
+        watched_pids,
     },
 };
 
@@ -28,35 +29,6 @@ use crate::{
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Default quiet window for `wait_for_idle`.
 const DEFAULT_QUIET_MS: u64 = 250;
-/// How often an in-flight wait re-checks `client_pid` liveness.
-const LIVENESS_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Whether `pid` still refers to a live, non-zombie process.
-///
-/// Reads `/proc` directly: a missing entry means the process is gone; a
-/// `Z`/`X` state means it exited and awaits (or completed) reaping.
-#[cfg(target_os = "linux")]
-fn pid_alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // The state letter follows the last ')' (comm can contain spaces).
-    match stat
-        .rsplit(')')
-        .next()
-        .and_then(|tail| tail.split_whitespace().next())
-    {
-        Some(state) => !matches!(state, "Z" | "X" | "x"),
-        None => true,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_alive(_pid: u32) -> bool {
-    // Process-liveness probing is only implemented on Linux; elsewhere the
-    // check is a no-op so disconnect cancellation still applies.
-    true
-}
 
 fn timeout_error(verb: &str, timeout_ms: u64) -> ErrorResponse {
     ErrorResponse::with_data(
@@ -72,18 +44,6 @@ fn cancelled(reason: &'static str) -> ErrorResponse {
         format!("wait cancelled: {reason}"),
         json!({"reason": reason}),
     )
-}
-
-/// Pids whose death cancels a wait: the explicit `client_pid` param plus
-/// the socket peer's `SO_PEERCRED` pid, deduplicated.
-fn watched_pids(client_pid: Option<u32>, peer_pid: Option<u32>) -> Vec<u32> {
-    let mut pids: Vec<u32> = Vec::new();
-    for pid in [client_pid, peer_pid].into_iter().flatten() {
-        if !pids.contains(&pid) {
-            pids.push(pid);
-        }
-    }
-    pids
 }
 
 /// One step of a wait's select loop.
