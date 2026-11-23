@@ -474,6 +474,12 @@ impl BusManager {
         }
     }
 
+    /// The live AT-SPI2 bus address, when the a11y bus is running — the
+    /// address `get_tree` connects through.
+    pub fn a11y_address(&self) -> Option<String> {
+        self.live_address(BusRole::A11y)
+    }
+
     /// The D-Bus environment to inject into the next `spawn_app` child.
     pub fn spawn_env(&self) -> BusEnv {
         BusEnv {

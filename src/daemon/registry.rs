@@ -30,6 +30,7 @@ use crate::{
     Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
     compositor::{JoinOutcome, join_bounded},
     daemon::{
+        a11y,
         bus::BusManager,
         changelog::{ChangeLog, Mark},
         now_ms,
@@ -159,6 +160,9 @@ pub struct Workspace {
     /// The workspace's private D-Bus session bus, AT-SPI2 bus and
     /// `at-spi2-registryd` — launched at creation, torn down with it.
     buses: BusManager,
+    /// Bounded ring of `get_tree` snapshots — the state behind M3.4's
+    /// staleness-checked refs and M3.5's `tree_diff`/`tree_find`.
+    tree_snapshots: Mutex<a11y::SnapshotStore>,
     /// Bounded seq-indexed event log plus named marks — the state behind
     /// `get_changes_since`, `mark_set` and `mark_list`. Shared with the
     /// event-pump thread.
@@ -265,6 +269,7 @@ impl Workspace {
             events,
             recent,
             processes: ProcessRegistry::new(),
+            tree_snapshots: Mutex::new(a11y::SnapshotStore::default()),
             change_log,
             seq,
             last_event_ms,
@@ -405,6 +410,31 @@ impl Workspace {
     /// AT-SPI2 buses — the `bus` section of `workspace_list` and `status`.
     pub fn bus_report(&self) -> Value {
         self.buses.report()
+    }
+
+    /// The workspace's live AT-SPI2 bus address, when its a11y bus is
+    /// running — the address `get_tree` connects through.
+    pub fn a11y_address(&self) -> Option<String> {
+        self.buses.a11y_address()
+    }
+
+    /// Records `windows` as the workspace's next `get_tree` snapshot and
+    /// returns it with its assigned `snapshot_id`.
+    pub fn record_tree_snapshot(&self, windows: Vec<a11y::FusedWindow>) -> a11y::TreeSnapshot {
+        self.tree_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(windows)
+    }
+
+    /// A retained `get_tree` snapshot by id — M3.4's staleness checks and
+    /// M3.5's `tree_diff` resolve prior snapshots through this.
+    pub fn tree_snapshot(&self, id: u64) -> Option<a11y::TreeSnapshot> {
+        self.tree_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
     }
 
     /// Attaches a named mark to the workspace's seq timeline (`mark_set`).

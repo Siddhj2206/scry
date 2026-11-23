@@ -9,6 +9,7 @@ pub mod input;
 pub mod output;
 pub mod spawn;
 pub mod status;
+pub mod tree;
 pub mod waits;
 pub mod windows;
 pub mod workspace;

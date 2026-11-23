@@ -2,6 +2,7 @@
 //! to a live `scry::Compositor` over its real Unix socket.
 #![allow(dead_code)] // each test binary uses a different subset of helpers
 
+pub mod a11y;
 pub mod daemon;
 
 use std::{

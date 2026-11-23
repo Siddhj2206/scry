@@ -105,6 +105,8 @@ enum Commands {
     /// Block on event-driven workspace conditions.
     #[command(subcommand)]
     Wait(WaitCommands),
+    /// Fused compositor + AT-SPI2 accessibility tree snapshot.
+    Tree(TreeArgs),
     /// Compact structured diff of everything that changed since a seq.
     Changes(ChangesArgs),
     /// Named marks on a workspace's seq timeline.
@@ -492,6 +494,19 @@ struct WaitIdleArgs {
     /// Overall bound in milliseconds (default 30000).
     #[arg(long, value_name = "MS")]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Args)]
+struct TreeArgs {
+    /// The workspace id.
+    #[arg(short, long, value_name = "ID")]
+    workspace: String,
+    /// Restrict the snapshot to one window id.
+    #[arg(long)]
+    window: Option<u64>,
+    /// Bound the a11y capture in milliseconds.
+    #[arg(long, value_name = "MS")]
+    deadline_ms: Option<u64>,
 }
 
 #[derive(Args)]
@@ -906,6 +921,16 @@ fn build_request(command: &Commands) -> Result<(Verb, Value, Outcome), String> {
                 params["timeout_ms"] = json!(ms);
             }
             (Verb::WaitForIdle, params, Outcome::Default)
+        }
+        C::Tree(args) => {
+            let mut params = ws(&args.workspace);
+            if let Some(window) = args.window {
+                params["window_id"] = json!(window);
+            }
+            if let Some(ms) = args.deadline_ms {
+                params["deadline_ms"] = json!(ms);
+            }
+            (Verb::GetTree, params, Outcome::Default)
         }
         C::Changes(args) => (
             Verb::GetChangesSince,

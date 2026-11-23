@@ -96,6 +96,7 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::waits::WAIT_FOR_WINDOW,
     crate::daemon::methods::waits::WAIT_FOR_COMMIT,
     crate::daemon::methods::waits::WAIT_FOR_IDLE,
+    crate::daemon::methods::tree::GET_TREE,
     crate::daemon::methods::status::STATUS,
 ];
 

@@ -53,6 +53,8 @@ pub enum Verb {
     WaitForCommit,
     /// `wait_for_idle`.
     WaitForIdle,
+    /// `get_tree`.
+    GetTree,
     /// `get_changes_since`.
     GetChangesSince,
     /// `mark_set`.
@@ -88,6 +90,7 @@ impl Verb {
             Self::WaitForWindow => "wait_for_window",
             Self::WaitForCommit => "wait_for_commit",
             Self::WaitForIdle => "wait_for_idle",
+            Self::GetTree => "get_tree",
             Self::GetChangesSince => "get_changes_since",
             Self::MarkSet => "mark_set",
             Self::MarkList => "mark_list",
@@ -349,6 +352,7 @@ pub fn render(verb: Verb, r: &Value, outcome: &Outcome) -> String {
         Verb::WaitForIdle => {
             format!("workspace idle after {}ms quiet{}", r["quiet_ms"], at)
         }
+        Verb::GetTree => format_tree(r),
         Verb::GetChangesSince => serde_json::to_string_pretty(r).unwrap_or_default(),
         Verb::MarkSet => {
             let mark = &r["mark"];
@@ -426,6 +430,82 @@ fn result_data_len(r: &Value) -> usize {
         .and_then(|b64| BASE64.decode(b64).ok())
         .map(|b| b.len())
         .unwrap_or(0)
+}
+
+/// Human rendering of `get_tree`: a snapshot header, one line per window
+/// and an indented `[eN] role "name" (x, y WxH)` per node — the compact
+/// canonical line shape `tree_find`/`tree_diff` reuse.
+fn format_tree(r: &Value) -> String {
+    let mut out = format!("snapshot {}", r["snapshot_id"]);
+    if let Some(seq) = r["seq"].as_u64() {
+        out.push_str(&format!(" (seq {seq})"));
+    }
+    let Some(windows) = r["windows"].as_array() else {
+        out.push_str("\nno windows");
+        return out;
+    };
+    if windows.is_empty() {
+        out.push_str("\nno windows");
+        return out;
+    }
+    for w in windows {
+        out.push('\n');
+        out.push_str(&format_tree_window(w));
+    }
+    out
+}
+
+/// One `get_tree` window line plus its indented accessibility subtree.
+fn format_tree_window(w: &Value) -> String {
+    let g = &w["geometry"];
+    let mut line = format!(
+        "window {} {}{}({},{ } {}x{})  a11y={}",
+        w["window_id"],
+        w["app_id"]
+            .as_str()
+            .map(|s| format!("{s:?} "))
+            .unwrap_or_default(),
+        w["title"]
+            .as_str()
+            .map(|s| format!("{s:?} "))
+            .unwrap_or_default(),
+        g["x"],
+        g["y"],
+        g["width"],
+        g["height"],
+        w["a11y_status"].as_str().unwrap_or("?"),
+    );
+    if let Some(error) = w["a11y_error"].as_str() {
+        line.push_str(&format!(" — {error}"));
+    }
+    if let Some(hint) = w["hint"].as_str() {
+        line.push_str(&format!(" [{hint}]"));
+    }
+    if let Some(root) = w.get("root").and_then(|r| r.as_object()) {
+        format_tree_node(&Value::Object(root.clone()), 0, &mut line);
+    }
+    line
+}
+
+/// One indented canonical tree line per node, depth-first.
+fn format_tree_node(node: &Value, depth: usize, out: &mut String) {
+    let indent = "  ".repeat(depth + 1);
+    let bounds = node["bounds"]
+        .as_object()
+        .map(|b| format!(" ({},{ } {}x{})", b["x"], b["y"], b["width"], b["height"]))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "\n{indent}[{}] {} {:?}{}",
+        node["ref"].as_str().unwrap_or("?"),
+        node["role"].as_str().unwrap_or("?"),
+        node["name"].as_str().unwrap_or(""),
+        bounds,
+    ));
+    if let Some(children) = node["children"].as_array() {
+        for child in children {
+            format_tree_node(child, depth + 1, out);
+        }
+    }
 }
 
 /// Human rendering of `status`: the narrative plus findings and next steps.

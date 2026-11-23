@@ -20,6 +20,7 @@
 //!                                       └───────────────────────────────┘
 //! ```
 
+pub mod a11y;
 pub mod bus;
 mod changelog;
 pub mod methods;
