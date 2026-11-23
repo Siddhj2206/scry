@@ -45,10 +45,12 @@
 mod compositor;
 mod error;
 mod event;
+mod frame_clock;
 mod handle;
 mod state;
 
 pub use compositor::Compositor;
 pub use error::{Error, Result};
 pub use event::{CompositorEvent, Rect, Seq, SurfaceId, WindowId, WindowInfo};
+pub use frame_clock::FrameClockMode;
 pub use handle::{CompositorHandle, Reply};

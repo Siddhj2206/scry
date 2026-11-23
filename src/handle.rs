@@ -16,6 +16,7 @@ use smithay::reexports::calloop::channel::Sender as CommandSender;
 use crate::{
     error::{Error, Result},
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
+    frame_clock::FrameClockMode,
 };
 
 /// How long a command waits for the compositor's reply before giving up.
@@ -61,6 +62,17 @@ pub(crate) enum Command {
     /// Ask a toplevel to close (`xdg_toplevel.close`).
     CloseWindow {
         id: WindowId,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Switch the virtual frame clock between realtime and paused modes.
+    SetFrameClockMode {
+        mode: FrameClockMode,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Advance the virtual frame clock by `duration`, releasing any pending
+    /// `wl_surface.frame` callbacks with the stepped timestamp.
+    StepFrameClock {
+        duration: Duration,
         reply: Sender<Outcome<()>>,
     },
 }
@@ -142,6 +154,28 @@ impl CompositorHandle {
     /// Requests `xdg_toplevel.close` for a window.
     pub fn close_window(&self, id: WindowId) -> Result<Reply<()>> {
         self.request(|reply| Command::CloseWindow { id, reply })
+    }
+
+    /// Switches the virtual frame clock between [`FrameClockMode::Realtime`]
+    /// (60Hz cadence, the default) and [`FrameClockMode::Paused`] (callbacks
+    /// held until [`Self::step_frame_clock`] advances the clock).
+    ///
+    /// The virtual presentation clock is never reset, so `wl_callback.done`
+    /// timestamps stay monotonic across mode switches.
+    pub fn set_frame_clock_mode(&self, mode: FrameClockMode) -> Result<Reply<()>> {
+        self.request(|reply| Command::SetFrameClockMode { mode, reply })
+    }
+
+    /// Advances the virtual frame clock by `duration`, firing every pending
+    /// `wl_surface.frame` callback once with the stepped presentation
+    /// timestamp.
+    ///
+    /// This is the deterministic counterpart to realtime mode for tests:
+    /// while paused, clients' animations advance exactly one step per call.
+    /// Stepping while realtime is also allowed and simply injects an extra
+    /// advancement on top of the regular ticks.
+    pub fn step_frame_clock(&self, duration: Duration) -> Result<Reply<()>> {
+        self.request(|reply| Command::StepFrameClock { duration, reply })
     }
 
     /// Shuts the compositor down: the event loop stops, all clients are

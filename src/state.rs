@@ -8,6 +8,7 @@
 use std::{
     os::unix::net::UnixStream,
     sync::{Arc, Mutex, OnceLock, mpsc::Sender as ReplySender},
+    time::Duration,
 };
 
 use smithay::{
@@ -22,6 +23,7 @@ use smithay::{
             EventLoop, Interest, LoopSignal, Mode, PostAction,
             channel::{Channel, Event as ChannelEvent},
             generic::Generic,
+            timer::{TimeoutAction, Timer},
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -53,6 +55,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     error::Error,
     event::{CompositorEvent, Rect, Seq, SurfaceId, WindowId, WindowInfo},
+    frame_clock::{FRAME_INTERVAL, FrameClock},
     handle::{Command, Reply},
 };
 
@@ -105,10 +108,8 @@ pub(crate) struct ScryState {
     // -- desktop model ------------------------------------------------------
     space: Space<Window>,
     popup_manager: PopupManager,
-    /// The always-present virtual output. Used by later sub-issues for frame
-    /// callbacks, captures and output management; kept alive so its global
-    /// stays advertised.
-    #[allow(dead_code)]
+    /// The always-present virtual output; also the scanout output reported
+    /// for `wl_surface.frame` callbacks.
     default_output: Output,
 
     // -- bookkeeping ---------------------------------------------------------
@@ -122,6 +123,8 @@ pub(crate) struct ScryState {
     next_surface_id: u64,
     /// Subscriber channels receiving every [`CompositorEvent`].
     subscribers: Vec<ReplySender<CompositorEvent>>,
+    /// Virtual frame clock driving `wl_surface.frame` callbacks.
+    frame_clock: FrameClock,
 
     // -- infrastructure ------------------------------------------------------
     display_handle: DisplayHandle,
@@ -170,6 +173,7 @@ impl ScryState {
             next_window_id: 1,
             next_surface_id: 1,
             subscribers: Vec::new(),
+            frame_clock: FrameClock::new(),
             display_handle: dh.clone(),
             loop_signal,
         }
@@ -489,10 +493,57 @@ impl ScryState {
                     }
                 }
             }
+            Command::SetFrameClockMode { mode, reply } => {
+                self.frame_clock.set_mode(mode);
+                self.seq += 1;
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: (),
+                }));
+            }
+            Command::StepFrameClock { duration, reply } => {
+                let time = self.frame_clock.step(duration);
+                self.send_frames(time);
+                self.seq += 1;
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: (),
+                }));
+            }
         }
         // Commands may have produced protocol traffic (configures, closes).
         if let Err(err) = self.display_handle.flush_clients() {
             debug!("failed to flush clients after command: {err}");
+        }
+    }
+
+    /// Fires every pending `wl_surface.frame` callback on all mapped
+    /// windows' surface trees, stamped with virtual presentation `time`.
+    ///
+    /// The throttle of [`Duration::ZERO`] and a scanout closure reporting
+    /// our one virtual output mean callbacks fire unconditionally, whatever
+    /// the surface's occlusion state — the right semantics for a headless
+    /// compositor.
+    fn send_frames(&mut self, time: Duration) {
+        for record in &self.windows {
+            record
+                .window
+                .send_frame(&self.default_output, time, Some(Duration::ZERO), |_, _| {
+                    Some(self.default_output.clone())
+                });
+        }
+        // Frame callbacks are protocol traffic; flush so clients observe
+        // them promptly rather than on the next unrelated dispatch.
+        if let Err(err) = self.display_handle.flush_clients() {
+            debug!("failed to flush clients after frame callbacks: {err}");
+        }
+    }
+
+    /// One frame-clock tick: in realtime mode advances the virtual clock and
+    /// fires pending frame callbacks; while paused, holds them.
+    fn frame_clock_tick(&mut self) {
+        if let Some(time) = self.frame_clock.tick() {
+            self.send_frames(time);
         }
     }
 
@@ -675,6 +726,16 @@ pub(crate) fn run(
                     Ok(PostAction::Continue)
                 },
             )
+            .map_err(|e| e.to_string())?;
+
+        // The virtual frame clock: fires every FRAME_INTERVAL (~60Hz). In
+        // realtime mode each tick fires pending wl_surface.frame callbacks;
+        // while paused the tick is a no-op, keeping mode switches cheap.
+        loop_handle
+            .insert_source(Timer::from_duration(FRAME_INTERVAL), |_, _, state| {
+                state.frame_clock_tick();
+                TimeoutAction::ToDuration(FRAME_INTERVAL)
+            })
             .map_err(|e| e.to_string())?;
 
         // The wayland display itself: dispatch client requests when readable.
