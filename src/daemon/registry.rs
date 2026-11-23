@@ -27,7 +27,10 @@ use tracing::{debug, info, warn};
 
 use crate::{
     Compositor, CompositorEvent, CompositorHandle, Seq, WindowId,
-    daemon::protocol::{ErrorResponse, code},
+    daemon::{
+        process::{ProcessInfo, ProcessRegistry, SpawnSpec},
+        protocol::{ErrorResponse, code},
+    },
     handle::Reply,
 };
 
@@ -143,6 +146,8 @@ pub struct Workspace {
     /// Bounded ring of the most recent events, for `wait_for_commit`'s
     /// "already happened" check. Shared with the event-pump thread.
     recent: Arc<Mutex<VecDeque<CompositorEvent>>>,
+    /// Managed children spawned by `spawn_app`, tracked until teardown.
+    processes: ProcessRegistry,
     /// Highest sequence number observed (events and command replies).
     /// Shared with the event-pump thread.
     seq: Arc<AtomicU64>,
@@ -222,6 +227,7 @@ impl Workspace {
             pump: Mutex::new(Some(pump)),
             events,
             recent,
+            processes: ProcessRegistry::new(),
             seq,
             last_event_ms,
             active_waits: Arc::new(AtomicUsize::new(0)),
@@ -308,6 +314,43 @@ impl Workspace {
             .is_some()
     }
 
+    /// Spawns a managed child process (`spawn_app`) with the workspace's
+    /// Wayland + AT-SPI environment profile.
+    ///
+    /// Fails if the workspace is already being torn down; if teardown races
+    /// the spawn, the just-started child is signalled along with the rest.
+    pub fn spawn_process(&self, spec: &SpawnSpec) -> Result<ProcessInfo, ErrorResponse> {
+        if !self.is_live() {
+            return Err(ErrorResponse::with_data(
+                code::UNKNOWN_WORKSPACE,
+                format!("workspace {:?} is closing", self.id),
+                json!({"workspace": self.id}),
+            ));
+        }
+        let info =
+            self.processes
+                .spawn(spec, self.handle.runtime_dir(), self.handle.socket_name())?;
+        if !self.is_live() {
+            // Teardown raced the spawn: make sure nothing escapes.
+            self.processes.terminate_all();
+            return Err(ErrorResponse::with_data(
+                code::UNKNOWN_WORKSPACE,
+                format!("workspace {:?} is closing", self.id),
+                json!({"workspace": self.id}),
+            ));
+        }
+        if let Err(err) = self.persist(None, None) {
+            warn!(workspace = %self.id, "failed to persist spawn metadata: {err}");
+        }
+        Ok(info)
+    }
+
+    /// Health snapshots of every child spawned into this workspace — the
+    /// process detail behind `workspace_list` and M2.4's `status`.
+    pub fn process_snapshot(&self) -> Vec<ProcessInfo> {
+        self.processes.snapshot()
+    }
+
     /// Runs a blocking `CompositorHandle` command off the async reactor and
     /// folds its `seq` into the workspace watermark.
     pub async fn call<T, F>(&self, f: F) -> Result<Reply<T>, ErrorResponse>
@@ -341,6 +384,7 @@ impl Workspace {
             "seq": self.seq(),
             "created_at_ms": self.created_at_ms,
             "last_active_ms": self.last_active_ms.load(Ordering::Relaxed),
+            "processes": self.processes.snapshot(),
             "active_waits": self.active_waits(),
         })
     }
@@ -368,9 +412,7 @@ impl Workspace {
             last_active_ms: self.last_active_ms.load(Ordering::Relaxed),
             closed_at_ms,
             close_reason: close_reason.map(str::to_string),
-            // Process tracking arrives with spawn_app (M2.3); the field keeps
-            // the on-disk schema stable for diagnostics until then.
-            spawned_pids: Vec::new(),
+            spawned_pids: self.processes.pids(),
         };
         if let Some(parent) = self.meta_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -387,6 +429,10 @@ impl Workspace {
     /// Blocking-friendly: callers run this inside `spawn_blocking`.
     fn teardown(&self, reason: &str) {
         debug!(workspace = %self.id, reason, "tearing down workspace");
+        // Children die first (SIGTERM, then bounded SIGKILL) while their
+        // Wayland connection still works, so well-behaved apps can exit
+        // cleanly.
+        self.processes.terminate_all();
         let compositor = self
             .compositor
             .lock()

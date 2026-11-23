@@ -21,6 +21,7 @@
 //! ```
 
 pub mod methods;
+pub mod process;
 pub mod protocol;
 pub mod registry;
 pub mod router;
