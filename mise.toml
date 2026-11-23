@@ -1,0 +1,38 @@
+[tools]
+rust = "latest"
+
+[env]
+RUST_LOG = "scry=debug,info"
+
+[tasks.check]
+run = "cargo check --all-targets"
+
+[tasks.build]
+run = "cargo build"
+
+[tasks.test]
+run = "cargo test"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.fmt]
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+run = "cargo fmt --all -- --check"
+
+[tasks.ci]
+depends = ["fmt-check", "clippy", "test"]
+
+[tasks.container-build]
+run = "podman build --target build -t scry-build -f Containerfile ."
+
+[tasks.container-build-e2e]
+run = "podman build --target e2e -t scry-e2e -f Containerfile ."
+
+[tasks.container-shell]
+run = "podman run --rm -it -v .:/workspace:Z -w /workspace scry-build bash"
+
+[tasks.container-test]
+run = "podman run --rm -v .:/workspace:Z -w /workspace scry-build cargo test"
