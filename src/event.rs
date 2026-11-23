@@ -6,6 +6,8 @@
 
 use smithay::utils::Rectangle;
 
+use crate::clipboard::SelectionKind;
+
 /// A monotonic sequence number assigned by the compositor.
 ///
 /// Sequence numbers start at `1` and increase by one for every emitted event
@@ -108,6 +110,21 @@ pub enum CompositorEvent {
         /// Damaged regions in buffer coordinates.
         damage: Vec<Rect>,
     },
+    /// A clipboard or primary selection changed ownership or offered MIME
+    /// types.
+    ///
+    /// Emitted when a client sets or clears a selection and when the
+    /// compositor itself sets or clears one via
+    /// [`CompositorHandle::set_selection`](crate::CompositorHandle::set_selection).
+    /// An empty `mime_types` means the selection was cleared.
+    ClipboardUpdated {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// Which selection changed.
+        selection: SelectionKind,
+        /// MIME types the new selection offers; empty when cleared.
+        mime_types: Vec<String>,
+    },
 }
 
 impl CompositorEvent {
@@ -117,7 +134,8 @@ impl CompositorEvent {
             Self::WindowMapped { seq, .. }
             | Self::WindowUpdated { seq, .. }
             | Self::WindowClosed { seq, .. }
-            | Self::SurfaceCommitted { seq, .. } => *seq,
+            | Self::SurfaceCommitted { seq, .. }
+            | Self::ClipboardUpdated { seq, .. } => *seq,
         }
     }
 }

@@ -5,7 +5,7 @@ use std::io;
 use smithay::reexports::wayland_server::BindError;
 use thiserror::Error;
 
-use crate::event::WindowId;
+use crate::{clipboard::SelectionKind, event::WindowId};
 
 /// Result alias for fallible `scry` operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -36,4 +36,19 @@ pub enum Error {
     /// A command targeted a window id that no longer exists.
     #[error("unknown window id: {0:?}")]
     UnknownWindow(WindowId),
+
+    /// A read was requested on a selection that is currently empty.
+    #[error("the {0} selection is empty")]
+    EmptySelection(SelectionKind),
+
+    /// The current selection does not offer the requested MIME type.
+    #[error("the {kind} selection does not offer mime type {requested:?} (offers: {offered:?})")]
+    MimeTypeNotOffered {
+        /// Which selection was read.
+        kind: SelectionKind,
+        /// The MIME type that was requested.
+        requested: String,
+        /// MIME types the selection actually offers.
+        offered: Vec<String>,
+    },
 }
