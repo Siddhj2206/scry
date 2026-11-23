@@ -37,6 +37,18 @@ pub enum Error {
     #[error("unknown window id: {0:?}")]
     UnknownWindow(WindowId),
 
+    /// A command targeted an output name that does not exist.
+    #[error("unknown output: {0}")]
+    UnknownOutput(String),
+
+    /// A frame capture could not be produced.
+    #[error("capture failed: {0}")]
+    Capture(String),
+
+    /// Encoding a captured frame failed.
+    #[error("frame encoding failed: {0}")]
+    Encode(#[from] image::ImageError),
+
     /// A read was requested on a selection that is currently empty.
     #[error("the {0} selection is empty")]
     EmptySelection(SelectionKind),

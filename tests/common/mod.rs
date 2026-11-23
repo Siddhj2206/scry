@@ -21,7 +21,7 @@ use wayland_client::{
 };
 use wayland_protocols::{
     wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
-    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+    xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -81,6 +81,10 @@ pub struct ClientState {
     pub output_scales: Vec<i32>,
     pub enters: usize,
     pub frame_callbacks: usize,
+    /// `xdg_popup.configure` events: `(x, y, width, height)`.
+    pub popup_configures: VecDeque<(i32, i32, i32, i32)>,
+    /// `xdg_popup.popup_done` count.
+    pub popup_done: usize,
     /// `callback_data` (presentation time, ms) of every `wl_callback.done`.
     pub frame_times: Vec<u32>,
     /// `wl_data_device` clipboard plumbing.
@@ -176,25 +180,36 @@ impl TestClient {
 
     /// Allocates a wl_shm buffer filled with a solid 0xAARRGGBB pixel.
     pub fn shm_buffer(&self, width: i32, height: i32, argb: u32) -> wl_buffer::WlBuffer {
+        self.shm_buffer_pixels(
+            width,
+            height,
+            &vec![argb; (width * height) as usize],
+            wl_shm::Format::Argb8888,
+        )
+    }
+
+    /// Allocates a wl_shm buffer from explicit 0xAARRGGBB pixels and a format.
+    ///
+    /// `pixels` is row-major; for `Argb8888`/`Xrgb8888` each u32 is written
+    /// little-endian, matching the shm wire layout.
+    pub fn shm_buffer_pixels(
+        &self,
+        width: i32,
+        height: i32,
+        pixels: &[u32],
+        format: wl_shm::Format,
+    ) -> wl_buffer::WlBuffer {
+        assert_eq!(pixels.len(), (width * height) as usize);
         let mut file = tempfile::tempfile().expect("tempfile failed");
-        let pixel = argb.to_le_bytes();
         let mut data = Vec::with_capacity((width * height * 4) as usize);
-        for _ in 0..(width * height) {
-            data.extend_from_slice(&pixel);
+        for pixel in pixels {
+            data.extend_from_slice(&pixel.to_le_bytes());
         }
         file.write_all(&data).expect("write shm data failed");
         let pool = self
             .shm
             .create_pool(file.as_fd(), width * height * 4, &self.qh, ());
-        pool.create_buffer(
-            0,
-            width,
-            height,
-            width * 4,
-            wl_shm::Format::Argb8888,
-            &self.qh,
-            (),
-        )
+        pool.create_buffer(0, width, height, width * 4, format, &self.qh, ())
     }
 
     /// Creates an xdg toplevel, waits for the initial configure (auto-acked by
@@ -252,6 +267,29 @@ wayland_client::delegate_noop!(ClientState: wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(ClientState: wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(ClientState: wayland_client::protocol::wl_subcompositor::WlSubcompositor);
 wayland_client::delegate_noop!(ClientState: wayland_client::protocol::wl_subsurface::WlSubsurface);
+wayland_client::delegate_noop!(ClientState: xdg_positioner::XdgPositioner);
+
+impl Dispatch<xdg_popup::XdgPopup, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _proxy: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => state.popup_configures.push_back((x, y, width, height)),
+            xdg_popup::Event::PopupDone => state.popup_done += 1,
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for ClientState {
     fn event(

@@ -65,6 +65,19 @@ pub struct WindowInfo {
     pub activated: bool,
 }
 
+/// Structured metadata describing one mapped `xdg_popup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupInfo {
+    /// Identifier of the popup's `wl_surface`.
+    pub surface_id: SurfaceId,
+    /// The window the popup is anchored to, if its parent surface belongs to
+    /// a mapped window.
+    pub window_id: Option<WindowId>,
+    /// The popup's positioner geometry: position relative to the parent's
+    /// window geometry, and size in surface-local coordinates.
+    pub geometry: Rect,
+}
+
 /// An event emitted by the compositor on its ordered event stream.
 ///
 /// New variants are added as scry gains capabilities (popups, clipboard,
@@ -92,6 +105,21 @@ pub enum CompositorEvent {
         seq: Seq,
         /// Identifier of the window that closed.
         window_id: WindowId,
+    },
+    /// An `xdg_popup` mapped: its first buffer commit became visible.
+    PopupMapped {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// Metadata snapshot at map time.
+        popup: PopupInfo,
+    },
+    /// A mapped `xdg_popup` closed (destroyed, dismissed, or unmapped via a
+    /// null buffer).
+    PopupClosed {
+        /// Sequence number of this event.
+        seq: Seq,
+        /// Identifier of the popup's `wl_surface`.
+        surface_id: SurfaceId,
     },
     /// A `wl_surface` commit was applied.
     ///
@@ -134,6 +162,8 @@ impl CompositorEvent {
             Self::WindowMapped { seq, .. }
             | Self::WindowUpdated { seq, .. }
             | Self::WindowClosed { seq, .. }
+            | Self::PopupMapped { seq, .. }
+            | Self::PopupClosed { seq, .. }
             | Self::SurfaceCommitted { seq, .. }
             | Self::ClipboardUpdated { seq, .. } => *seq,
         }

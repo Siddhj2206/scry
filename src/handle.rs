@@ -17,6 +17,7 @@ use crate::{
     clipboard::SelectionKind,
     error::{Error, Result},
     event::{CompositorEvent, Seq, WindowId, WindowInfo},
+    frame::Frame,
     frame_clock::FrameClockMode,
 };
 
@@ -34,6 +35,22 @@ pub struct Reply<T> {
     pub seq: Seq,
     /// The command's return value.
     pub value: T,
+}
+
+impl<T> Reply<T> {
+    /// Maps the reply value, keeping `seq` and propagating errors.
+    pub(crate) fn try_map<U, E>(
+        self,
+        f: impl FnOnce(T) -> std::result::Result<U, E>,
+    ) -> Result<Reply<U>>
+    where
+        Error: From<E>,
+    {
+        Ok(Reply {
+            seq: self.seq,
+            value: f(self.value)?,
+        })
+    }
 }
 
 /// The payload carried back over a reply channel.
@@ -64,6 +81,17 @@ pub(crate) enum Command {
     CloseWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
+    },
+    /// Composite a window's complete surface tree (root, subsurfaces and
+    /// popups) into an occlusion-free frame.
+    CaptureWindow {
+        id: WindowId,
+        reply: Sender<Outcome<Frame>>,
+    },
+    /// Composite all visible windows in z-order over a named output.
+    CaptureOutput {
+        name: String,
+        reply: Sender<Outcome<Frame>>,
     },
     /// Switch the virtual frame clock between realtime and paused modes.
     SetFrameClockMode {
@@ -180,6 +208,38 @@ impl CompositorHandle {
         self.request(|reply| Command::CloseWindow { id, reply })
     }
 
+    /// Captures a window's complete surface tree into an RGBA frame.
+    ///
+    /// The capture is occlusion-free: the window is composited on its own,
+    /// including subsurfaces and child popups, regardless of overlap or
+    /// off-screen placement on the virtual output.
+    pub fn capture_window(&self, id: WindowId) -> Result<Reply<Frame>> {
+        self.request(|reply| Command::CaptureWindow { id, reply })
+    }
+
+    /// [`capture_window`](Self::capture_window) encoded as PNG.
+    pub fn capture_window_png(&self, id: WindowId) -> Result<Reply<Vec<u8>>> {
+        self.capture_window(id)?.try_map(|frame| frame.encode_png())
+    }
+
+    /// [`capture_window`](Self::capture_window) encoded as lossless WebP.
+    pub fn capture_window_webp(&self, id: WindowId) -> Result<Reply<Vec<u8>>> {
+        self.capture_window(id)?
+            .try_map(|frame| frame.encode_webp())
+    }
+
+    /// Captures a whole virtual output: all visible windows composited in
+    /// z-order over an opaque black background.
+    ///
+    /// `name` is the `wl_output` name (the built-in virtual output is
+    /// `"Virtual-1"`); unknown names return [`Error::UnknownOutput`].
+    pub fn capture_output(&self, name: &str) -> Result<Reply<Frame>> {
+        self.request(|reply| Command::CaptureOutput {
+            name: name.to_string(),
+            reply,
+        })
+    }
+
     /// Switches the virtual frame clock between [`FrameClockMode::Realtime`]
     /// (60Hz cadence, the default) and [`FrameClockMode::Paused`] (callbacks
     /// held until [`Self::step_frame_clock`] advances the clock).
@@ -219,6 +279,18 @@ impl CompositorHandle {
             data,
             reply,
         })
+    }
+
+    /// [`capture_output`](Self::capture_output) encoded as PNG.
+    pub fn capture_output_png(&self, name: &str) -> Result<Reply<Vec<u8>>> {
+        self.capture_output(name)?
+            .try_map(|frame| frame.encode_png())
+    }
+
+    /// [`capture_output`](Self::capture_output) encoded as lossless WebP.
+    pub fn capture_output_webp(&self, name: &str) -> Result<Reply<Vec<u8>>> {
+        self.capture_output(name)?
+            .try_map(|frame| frame.encode_webp())
     }
 
     /// Clears the current `kind` selection.
