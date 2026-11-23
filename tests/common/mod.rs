@@ -157,6 +157,8 @@ pub struct ClientState {
     pub last_button_serial: u32,
     /// (axis: 0 vertical / 1 horizontal, value)
     pub pointer_axis: Vec<(u32, f64)>,
+    /// `wl_pointer.frame` events delivered.
+    pub pointer_frames: u32,
     /// Raw keymap payload from `wl_keyboard.keymap` (XKB v1 text format).
     pub keymap: Option<Vec<u8>>,
     /// (surface, serial)
@@ -764,6 +766,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for ClientState {
                 };
                 state.pointer_axis.push((axis, value));
             }
+            wl_pointer::Event::Frame => state.pointer_frames += 1,
             _ => {}
         }
     }

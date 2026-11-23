@@ -444,6 +444,88 @@ fn get_tree_bounds_track_place_window() {
     );
 }
 
+/// Regression (real GTK4, M3.7): a peer whose `CoordType::Screen`
+/// extents are degenerate — `(0, 0, w, h)` for every node, exactly what
+/// GTK4 serves under Wayland where clients cannot know their compositor
+/// position — must still fuse correctly. The daemon reads
+/// `CoordType::Window` extents and anchors them on the window's
+/// compositor geometry; a `click_node` then lands on the widget's real
+/// position rather than the window's top-left corner.
+#[test]
+fn get_tree_fuses_degenerate_screen_extents_peer() {
+    let daemon = spawn_daemon();
+    let mut rpc = RpcClient::connect(&daemon.socket_path);
+    let (ws, socket) = create_workspace(&mut rpc, "winrel", json!({}));
+    let mut client = TestClient::connect(&socket);
+    let window = map_window(
+        &mut rpc,
+        "winrel",
+        &mut client,
+        "org.scry.WinRel",
+        "WinRel",
+        400,
+        300,
+    );
+    let window_id = window["id"].as_u64().unwrap();
+
+    let a11y_addr = ws["bus"]["at_spi"]["address"].as_str().unwrap();
+    let peer = a11y::serve(a11y_addr, &app_tree(&[("WinRel", "OK")]));
+    // GTK4 mode: frame + button lose their position under
+    // CoordType::Screen but keep it under Window/Parent.
+    peer.degenerate_screen("/fake/a11y/app/0");
+    peer.degenerate_screen("/fake/a11y/app/0/0");
+
+    rpc.call(
+        "place_window",
+        json!({"workspace": "winrel", "window": window_id, "x": 120, "y": 60}),
+    );
+    wait_for_window(&mut rpc, "winrel", |w| {
+        w["geometry"]["x"] == 120 && w["geometry"]["y"] == 60
+    });
+
+    let windows = tree_windows(&mut rpc, "winrel");
+    let w = fused_window(&windows, window_id);
+    assert_eq!(w["a11y_status"], "ok", "window entry: {w}");
+    assert_eq!(
+        w["root"]["bounds"],
+        json!({"x": 120, "y": 60, "width": 400, "height": 300}),
+        "fused root bounds: {}",
+        w["root"]
+    );
+    // The button's real position (10,20 inside the frame) fuses onto
+    // the placed geometry — under CoordType::Screen it would collapse
+    // to the window's own origin.
+    assert_eq!(
+        w["root"]["children"][0]["bounds"],
+        json!({"x": 130, "y": 80, "width": 80, "height": 30}),
+        "fused child bounds: {}",
+        w["root"]["children"][0]
+    );
+
+    // click_node computes the fused center from the same live extents:
+    // the pointer must land on the button's real (50,35) window-local
+    // center, not on a degenerate (40,15).
+    rpc.call("click_node", json!({"workspace": "winrel", "ref": "e2"}));
+    const BTN_LEFT: u32 = 0x110;
+    client.pump_until(|s| {
+        s.pointer_buttons
+            .iter()
+            .any(|&(b, st)| b == BTN_LEFT && st == 0)
+    });
+    let position = client
+        .state
+        .pointer_enters
+        .iter()
+        .map(|&(_, x, y)| (x, y))
+        .chain(client.state.pointer_motions.iter().copied())
+        .last()
+        .expect("no pointer position event delivered");
+    assert!(
+        (position.0 - 50.0).abs() < 1.0 && (position.1 - 35.0).abs() < 1.0,
+        "pointer landed at {position:?}, expected ~(50,35)"
+    );
+}
+
 /// `window_id` scoping returns only that window's fused entry; an unknown
 /// id errors with `UNKNOWN_WINDOW`.
 #[test]
