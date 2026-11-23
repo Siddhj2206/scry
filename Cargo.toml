@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
 image = { version = "0.25", default-features = false, features = [
     "png",
     "webp",
 ] }
-signal-hook = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
     "desktop",
@@ -16,6 +20,16 @@ smithay = { version = "0.7", default-features = false, features = [
 tempfile = "3"
 thiserror = "2"
 tiny-skia = "0.12"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 

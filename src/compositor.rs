@@ -1,10 +1,14 @@
 //! [`Compositor`]: the owning lifecycle object for a headless scry instance.
 
-use std::{sync::mpsc::channel, thread::JoinHandle, time::Duration};
+use std::{
+    sync::mpsc::channel,
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use smithay::reexports::{calloop::channel, wayland_server::ListeningSocket};
 use tempfile::TempDir;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     error::{Error, Result},
@@ -17,6 +21,37 @@ const SOCKET_NAME: &str = "wayland-0";
 
 /// How long startup waits for the compositor thread to report readiness.
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long [`Compositor::drop`] waits for the compositor thread before
+/// detaching it, so a wedged loop can never deadlock a workspace teardown.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The result of [`join_bounded`].
+pub(crate) enum JoinOutcome {
+    /// The thread finished and was joined.
+    Joined,
+    /// The thread outlived the deadline; its `JoinHandle` was dropped,
+    /// detaching it (the thread keeps running).
+    TimedOut,
+    /// The thread finished but panicked.
+    Panicked,
+}
+
+/// Joins `join`, giving up after `within` so teardown paths never block
+/// forever on a stuck worker.
+pub(crate) fn join_bounded(join: JoinHandle<()>, within: Duration) -> JoinOutcome {
+    let deadline = Instant::now() + within;
+    while !join.is_finished() {
+        if Instant::now() >= deadline {
+            return JoinOutcome::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match join.join() {
+        Ok(()) => JoinOutcome::Joined,
+        Err(_) => JoinOutcome::Panicked,
+    }
+}
 
 /// A running headless Wayland compositor.
 ///
@@ -95,11 +130,32 @@ impl Compositor {
 
 impl Drop for Compositor {
     fn drop(&mut self) {
-        // Ask the loop to stop, then join. If the loop is already gone the
-        // command send fails fast and join still returns promptly.
-        let _ = self.handle.shutdown();
+        // Ask the loop to stop, then join (bounded). If the loop is
+        // already gone the command send fails fast and join still returns
+        // promptly; a genuinely stuck loop detaches rather than
+        // deadlocking the dropper.
+        match self.handle.shutdown() {
+            // The loop may already be gone (a prior shutdown()); that is
+            // normal and not worth a warning. Anything else is logged.
+            Err(crate::Error::Disconnected) => {}
+            Err(err) => warn!(
+                socket = %self.handle.socket_path().display(),
+                "compositor shutdown command failed during drop: {err}"
+            ),
+            Ok(_) => {}
+        }
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            match join_bounded(join, JOIN_TIMEOUT) {
+                JoinOutcome::Joined => {}
+                JoinOutcome::TimedOut => warn!(
+                    socket = %self.handle.socket_path().display(),
+                    "compositor thread did not exit; detached"
+                ),
+                JoinOutcome::Panicked => warn!(
+                    socket = %self.handle.socket_path().display(),
+                    "compositor thread panicked"
+                ),
+            }
         }
     }
 }

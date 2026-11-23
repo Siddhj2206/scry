@@ -4,6 +4,7 @@
 //! sequence number (`seq`) so callers can correlate commands, commits and
 //! lifecycle transitions deterministically.
 
+use serde::{Deserialize, Serialize};
 use smithay::utils::Rectangle;
 
 use crate::clipboard::SelectionKind;
@@ -17,7 +18,7 @@ pub type Seq = u64;
 
 /// An axis-aligned rectangle, in the coordinate space documented by the field
 /// that carries it.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rect {
     /// Horizontal offset of the top-left corner.
     pub x: i32,
@@ -41,15 +42,17 @@ impl<K> From<Rectangle<i32, K>> for Rect {
 }
 
 /// Opaque identifier of a mapped toplevel window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WindowId(pub u64);
 
 /// Opaque identifier of a `wl_surface`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SurfaceId(pub u64);
 
 /// Structured metadata describing one mapped toplevel.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WindowInfo {
     /// Stable identifier for the lifetime of the mapping.
     pub id: WindowId,
@@ -77,7 +80,7 @@ pub struct WindowInfo {
 }
 
 /// Structured metadata describing one mapped `xdg_popup`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PopupInfo {
     /// Identifier of the popup's `wl_surface`.
     pub surface_id: SurfaceId,
@@ -87,6 +90,25 @@ pub struct PopupInfo {
     /// The popup's positioner geometry: position relative to the parent's
     /// window geometry, and size in surface-local coordinates.
     pub geometry: Rect,
+}
+
+/// One retained damage record: the normalized buffer-space rectangles a
+/// `wl_surface` commit damaged, stamped with the seq of its
+/// [`CompositorEvent::SurfaceCommitted`] event.
+///
+/// The compositor keeps a bounded log of these (see
+/// [`CompositorHandle::damage_since`](crate::CompositorHandle::damage_since))
+/// so callers can diff regions without re-capturing frames.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DamageEntry {
+    /// Sequence number of the `SurfaceCommitted` event that produced it.
+    pub seq: Seq,
+    /// The `wl_surface` that committed the damage.
+    pub surface_id: SurfaceId,
+    /// The window the surface belonged to at commit time, if any.
+    pub window_id: Option<WindowId>,
+    /// Damaged regions, normalized to buffer coordinates.
+    pub damage: Vec<Rect>,
 }
 
 /// An event emitted by the compositor on its ordered event stream.

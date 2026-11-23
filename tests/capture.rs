@@ -410,8 +410,12 @@ fn output_capture_z_order_and_occlusion_free_window_capture() {
 
     let mut client = TestClient::connect(handle.socket_path());
     // Bottom window: 40x40 red; top window (mapped later): 20x20 green.
+    // Placement is explicit so the test does not depend on where the
+    // deterministic initial layout happened to cascade the windows.
     let (red, _t1) = map_pattern_window(&mut client, &events, 40, 40, &vec![0xffff_0000; 1600]);
     let (green, _t2) = map_pattern_window(&mut client, &events, 20, 20, &vec![0xff00_ff00; 400]);
+    handle.place_window(red, (0, 0), None).unwrap();
+    handle.place_window(green, (0, 0), None).unwrap();
 
     let frame = handle
         .capture_output("Virtual-1")

@@ -176,7 +176,7 @@ takeover.
 
 ## 4. Phase 2 — Headless GPU, Live Browser Viewer, Human Takeover & Flight Recorder
 
-### M5 — Optional GPU acceleration (`zwp_linux_dmabuf_v1`)
+### M5 — Optional GPU acceleration (`zwp_linux_dmabuf_v1`) & rich input
 
 - Headless EGL/GBM render-node path (`/dev/dri/renderD128`) with `llvmpipe`
   software fallback and `zwp_linux_dmabuf_v1` import so GPU-first apps
@@ -185,8 +185,12 @@ takeover.
 - Strictly behind an opt-in Cargo feature (`dmabuf` / `renderer_gles`); the
   `wl_shm`/`tiny-skia` path remains the default zero-GPU baseline for CI and
   tests.
+- Rich trackpad & touch input: expose `scroll` (`wl_pointer.axis` vertical and
+  horizontal) over JSON-RPC/CLI/MCP, and add `zwp_pointer_gestures_v1` (swipe,
+  pinch, hold) plus optional `wl_touch` in the compositor and Control API.
 - Acceptance: GPU-backed native Wayland apps map, render, and capture cleanly
-  when enabled, while default `cargo test` builds without GBM/EGL headers.
+  when enabled, while default `cargo test` builds without GBM/EGL headers;
+  scroll and trackpad gesture events deliver accurately to Wayland clients.
 
 ### M6 — Live streaming viewer
 

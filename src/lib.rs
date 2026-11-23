@@ -49,6 +49,8 @@
 
 mod clipboard;
 mod compositor;
+/// The control daemon: Unix-socket JSON-RPC 2.0 API and workspace lifecycle.
+pub mod daemon;
 mod error;
 mod event;
 mod frame;
@@ -63,7 +65,9 @@ mod state;
 pub use clipboard::SelectionKind;
 pub use compositor::Compositor;
 pub use error::{Error, Result};
-pub use event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo};
+pub use event::{
+    CompositorEvent, DamageEntry, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo,
+};
 pub use frame::Frame;
 pub use frame_clock::FrameClockMode;
 pub use handle::{CompositorHandle, Reply};

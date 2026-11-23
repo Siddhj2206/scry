@@ -16,7 +16,7 @@ use smithay::reexports::calloop::channel::Sender as CommandSender;
 use crate::{
     clipboard::SelectionKind,
     error::{Error, Result},
-    event::{CompositorEvent, PopupInfo, Seq, WindowId, WindowInfo},
+    event::{CompositorEvent, DamageEntry, PopupInfo, Seq, WindowId, WindowInfo},
     frame::Frame,
     frame_clock::FrameClockMode,
     input::{PointerButton, PointerTarget},
@@ -87,6 +87,20 @@ pub(crate) enum Command {
     CloseWindow {
         id: WindowId,
         reply: Sender<Outcome<()>>,
+    },
+    /// Move a toplevel to exact logical coordinates and optionally request
+    /// a resize through the configure/ack lifecycle.
+    PlaceWindow {
+        id: WindowId,
+        position: (i32, i32),
+        size: Option<(i32, i32)>,
+        reply: Sender<Outcome<()>>,
+    },
+    /// Snapshot the retained damage log: every recorded commit's damage
+    /// with `seq` strictly greater than `since`.
+    Damage {
+        since: Seq,
+        reply: Sender<Outcome<Vec<DamageEntry>>>,
     },
 
     // -- input ---------------------------------------------------------------
@@ -194,6 +208,12 @@ pub(crate) enum Command {
         kind: SelectionKind,
         reply: Sender<Outcome<Vec<String>>>,
     },
+    /// Reserve a fresh sequence point on the compositor's timeline.
+    ///
+    /// Daemon-side constructs that occupy the shared seq timeline (named
+    /// marks) allocate through this command so their seqs interleave
+    /// correctly with compositor events and command replies.
+    BumpSeq { reply: Sender<Outcome<()>> },
 }
 
 /// The in-process handle used to drive and observe a running [`crate::Compositor`].
@@ -274,6 +294,41 @@ impl CompositorHandle {
             size: (width, height),
             reply,
         })
+    }
+
+    /// Moves a window to exact logical coordinates and, when `size` is
+    /// given, requests that size through the `xdg_toplevel` configure/ack
+    /// lifecycle.
+    ///
+    /// The position applies immediately in compositor space (a
+    /// [`CompositorEvent::WindowUpdated`] reports it right away); the
+    /// requested size lands once the client acks the configure and commits
+    /// at the new size, emitting a second `WindowUpdated`. Moving preserves
+    /// the window's stacking position. `size: None` is a pure move and sends
+    /// no configure.
+    pub fn place_window(
+        &self,
+        id: WindowId,
+        position: (i32, i32),
+        size: Option<(i32, i32)>,
+    ) -> Result<Reply<()>> {
+        self.request(|reply| Command::PlaceWindow {
+            id,
+            position,
+            size,
+            reply,
+        })
+    }
+
+    /// Damage records for surface commits with `seq` strictly greater
+    /// than `since` (`0` returns the whole retained log).
+    ///
+    /// Entries carry normalized buffer-space rectangles and the window the
+    /// committing surface belonged to — exactly what `get_damage` exposes
+    /// over the control API. The log is bounded; entries older than its
+    /// retention window are dropped silently.
+    pub fn damage_since(&self, since: Seq) -> Result<Reply<Vec<DamageEntry>>> {
+        self.request(|reply| Command::Damage { since, reply })
     }
 
     /// Requests `xdg_toplevel.close` for a window.
@@ -528,6 +583,16 @@ impl CompositorHandle {
     /// The MIME types the current `kind` selection offers; empty when unset.
     pub fn selection_mime_types(&self, kind: SelectionKind) -> Result<Reply<Vec<String>>> {
         self.request(|reply| Command::SelectionMimeTypes { kind, reply })
+    }
+
+    /// Reserves and returns the next sequence number on the compositor's
+    /// timeline, in `reply.seq`.
+    ///
+    /// The returned seq is a real, spent timeline point: later events and
+    /// command replies are strictly greater, so a seq allocated here is a
+    /// stable boundary for `get_changes_since`/`wait_for_commit` queries.
+    pub fn bump_seq(&self) -> Result<Reply<()>> {
+        self.request(|reply| Command::BumpSeq { reply })
     }
 
     /// Shuts the compositor down: the event loop stops, all clients are
