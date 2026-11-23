@@ -53,6 +53,12 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::output::LIST,
     crate::daemon::methods::output::REMOVE,
     crate::daemon::methods::spawn::SPAWN_APP,
+    crate::daemon::methods::input::CLICK,
+    crate::daemon::methods::input::DRAG,
+    crate::daemon::methods::input::TYPE_TEXT,
+    crate::daemon::methods::input::KEY_COMBO,
+    crate::daemon::methods::input::CLIPBOARD_GET,
+    crate::daemon::methods::input::CLIPBOARD_SET,
 ];
 
 /// Dispatches one request to its verb and wraps the payload in the standard
