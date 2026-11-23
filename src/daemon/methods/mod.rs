@@ -5,7 +5,9 @@
 //! waits, diffs) get their own module here.
 
 pub mod changes;
+pub mod input;
 pub mod output;
 pub mod spawn;
 pub mod status;
+pub mod windows;
 pub mod workspace;
