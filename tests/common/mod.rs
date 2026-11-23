@@ -5,7 +5,7 @@
 use std::{
     collections::VecDeque,
     io::Write,
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
     os::unix::net::UnixStream,
     path::Path,
     time::{Duration, Instant},
@@ -15,12 +15,13 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_offer, wl_output, wl_registry, wl_shm,
+        wl_shm_pool, wl_surface,
     },
 };
-use wayland_protocols::xdg::shell::client::{
-    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+use wayland_protocols::{
+    wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+    xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,6 +45,32 @@ pub fn wait_for_event(
     }
 }
 
+/// `wl_data_device` selection state collected by the dispatch impls in
+/// `tests/clipboard.rs`.
+#[derive(Default)]
+pub struct ClipboardChannel {
+    /// The most recent `wl_data_device.data_offer` object and its MIME types.
+    pub offer: Option<(wl_data_offer::WlDataOffer, Vec<String>)>,
+    /// Whether the seat's clipboard selection currently holds `offer`.
+    pub has_selection: bool,
+    /// `wl_data_source.send` requests received: `(mime_type, fd)` — the test
+    /// writes the payload into `fd`.
+    pub source_sends: VecDeque<(String, OwnedFd)>,
+}
+
+/// `zwp_primary_selection_v1` state collected by the dispatch impls in
+/// `tests/clipboard.rs`.
+#[derive(Default)]
+pub struct PrimaryChannel {
+    /// The most recent primary `data_offer` object and its MIME types.
+    pub offer: Option<(ZwpPrimarySelectionOfferV1, Vec<String>)>,
+    /// Whether the seat's primary selection currently holds `offer`.
+    pub has_selection: bool,
+    /// `zwp_primary_selection_source_v1.send` requests received: `(mime_type,
+    /// fd)` — the test writes the payload into `fd`.
+    pub source_sends: VecDeque<(String, OwnedFd)>,
+}
+
 #[derive(Default)]
 pub struct ClientState {
     pub shm_formats: Vec<wl_shm::Format>,
@@ -58,6 +85,12 @@ pub struct ClientState {
     pub popup_configures: VecDeque<(i32, i32, i32, i32)>,
     /// `xdg_popup.popup_done` count.
     pub popup_done: usize,
+    /// `callback_data` (presentation time, ms) of every `wl_callback.done`.
+    pub frame_times: Vec<u32>,
+    /// `wl_data_device` clipboard plumbing.
+    pub clipboard: ClipboardChannel,
+    /// `zwp_primary_selection_v1` plumbing.
+    pub primary: PrimaryChannel,
 }
 
 /// A connected test client with the core globals bound.
@@ -380,8 +413,9 @@ impl Dispatch<wl_callback::WlCallback, u32> for ClientState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
+        if let wl_callback::Event::Done { callback_data } = event {
             state.frame_callbacks += 1;
+            state.frame_times.push(callback_data);
         }
     }
 }

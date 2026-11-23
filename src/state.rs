@@ -8,6 +8,7 @@
 use std::{
     os::unix::net::UnixStream,
     sync::{Arc, Mutex, OnceLock, mpsc::Sender as ReplySender},
+    time::Duration,
 };
 
 use smithay::{
@@ -15,13 +16,14 @@ use smithay::{
         CommitCounter, on_commit_buffer_handler, with_renderer_surface_state,
     },
     desktop::{PopupKind, PopupManager, Space, Window},
-    input::{SeatHandler, SeatState},
+    input::{Seat, SeatHandler, SeatState, keyboard::XkbConfig},
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopSignal, Mode, PostAction,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
             channel::{Channel, Event as ChannelEvent},
             generic::Generic,
+            timer::{TimeoutAction, Timer},
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -32,7 +34,7 @@ use smithay::{
             },
         },
     },
-    utils::{Serial, Size},
+    utils::{SERIAL_COUNTER, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -41,6 +43,10 @@ use smithay::{
         },
         output::{OutputHandler, OutputManagerState},
         seat::WaylandFocus,
+        selection::{
+            data_device::{DataDeviceState, set_data_device_focus},
+            primary_selection::{PrimarySelectionState, set_primary_focus},
+        },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE,
             XdgPopupSurfaceData, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
@@ -51,8 +57,10 @@ use smithay::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    clipboard::SelectionOffers,
     error::Error,
     event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo},
+    frame_clock::{FRAME_INTERVAL, FrameClock},
     handle::{Command, Reply},
     render,
 };
@@ -106,19 +114,22 @@ pub(crate) struct ScryState {
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
     seat_state: SeatState<ScryState>,
+    pub(crate) data_device_state: DataDeviceState,
+    pub(crate) primary_selection_state: PrimarySelectionState,
     #[allow(dead_code)] // retained so the xdg_output_manager global lives
     output_manager_state: OutputManagerState,
 
     // -- desktop model ------------------------------------------------------
     space: Space<Window>,
     popup_manager: PopupManager,
-    /// The always-present virtual output. Used by later sub-issues for frame
-    /// callbacks, captures and output management; kept alive so its global
-    /// stays advertised.
-    #[allow(dead_code)]
+    /// The always-present virtual output; also the scanout output reported
+    /// for `wl_surface.frame` callbacks.
     default_output: Output,
 
     // -- bookkeeping ---------------------------------------------------------
+    /// The single seat: keyboard focus tracks the active toplevel and drives
+    /// `wl_data_device` / primary selection focus.
+    pub(crate) seat: Seat<ScryState>,
     /// Toplevels that were created but have not committed a buffer yet.
     pending_toplevels: Vec<ToplevelSurface>,
     /// Currently mapped toplevel windows.
@@ -126,19 +137,30 @@ pub(crate) struct ScryState {
     /// Currently mapped popups (any window's).
     mapped_popups: Vec<PopupRecord>,
     /// Monotonic event/ack sequence counter.
-    seq: Seq,
+    pub(crate) seq: Seq,
     next_window_id: u64,
     next_surface_id: u64,
+    /// What each seat selection currently offers (see [`crate::clipboard`]).
+    pub(crate) selection_offers: SelectionOffers,
     /// Subscriber channels receiving every [`CompositorEvent`].
     subscribers: Vec<ReplySender<CompositorEvent>>,
+    /// Virtual frame clock driving `wl_surface.frame` callbacks.
+    frame_clock: FrameClock,
 
     // -- infrastructure ------------------------------------------------------
-    display_handle: DisplayHandle,
+    pub(crate) display_handle: DisplayHandle,
+    /// Used to register asynchronous event sources mid-flight (selection
+    /// reads streaming back from clients).
+    pub(crate) loop_handle: LoopHandle<'static, ScryState>,
     loop_signal: LoopSignal,
 }
 
 impl ScryState {
-    fn new(dh: &DisplayHandle, loop_signal: LoopSignal) -> Self {
+    fn new(
+        dh: &DisplayHandle,
+        loop_handle: LoopHandle<'static, ScryState>,
+        loop_signal: LoopSignal,
+    ) -> Self {
         let default_output = Output::new(
             "Virtual-1".to_string(),
             PhysicalProperties {
@@ -164,23 +186,36 @@ impl ScryState {
         let mut space = Space::default();
         space.map_output(&default_output, (0, 0));
 
+        // The seat needs a keyboard for clients to own selections: smithay
+        // only honors `set_selection` from the client holding keyboard focus.
+        let mut seat_state = SeatState::new();
+        let mut seat = seat_state.new_wl_seat(dh, "seat0");
+        seat.add_keyboard(XkbConfig::default(), 200, 25)
+            .expect("failed to initialize the seat keyboard");
+
         Self {
             compositor_state: CompositorState::new_v6::<Self>(dh),
             xdg_shell_state: XdgShellState::new::<Self>(dh),
             shm_state: ShmState::new::<Self>(dh, vec![]),
-            seat_state: SeatState::new(),
+            seat_state,
+            data_device_state: DataDeviceState::new::<Self>(dh),
+            primary_selection_state: PrimarySelectionState::new::<Self>(dh),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             space,
             popup_manager: PopupManager::default(),
             default_output,
+            seat,
             pending_toplevels: Vec::new(),
             windows: Vec::new(),
             mapped_popups: Vec::new(),
             seq: 0,
             next_window_id: 1,
             next_surface_id: 1,
+            selection_offers: SelectionOffers::default(),
             subscribers: Vec::new(),
+            frame_clock: FrameClock::new(),
             display_handle: dh.clone(),
+            loop_handle,
             loop_signal,
         }
     }
@@ -208,7 +243,7 @@ impl ScryState {
     }
 
     /// Assigns the next sequence number to `event` and broadcasts it.
-    fn emit(&mut self, event: impl FnOnce(Seq) -> CompositorEvent) {
+    pub(crate) fn emit(&mut self, event: impl FnOnce(Seq) -> CompositorEvent) {
         self.seq += 1;
         let event = event(self.seq);
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
@@ -374,6 +409,7 @@ impl ScryState {
                     seq,
                     window_id: record.id,
                 });
+                self.refocus_topmost();
                 return;
             }
             let info = self.window_info(self.windows[pos].id, &self.windows[pos].window);
@@ -397,6 +433,7 @@ impl ScryState {
             return;
         };
         let toplevel = self.pending_toplevels.remove(pos);
+        let wl_surface = toplevel.wl_surface().clone();
         let window = Window::new_wayland_window(toplevel);
         self.space.map_element(window.clone(), (0, 0), true);
         window.on_commit();
@@ -410,6 +447,9 @@ impl ScryState {
             last_info: info.clone(),
         });
         self.emit(|seq| CompositorEvent::WindowMapped { seq, window: info });
+        // The newly mapped (activated) toplevel takes keyboard focus, which
+        // `focus_changed` mirrors into the seat's selection focus.
+        self.focus_surface(Some(wl_surface));
     }
 
     /// Maps / unmaps an `xdg_popup` following a commit.
@@ -505,7 +545,28 @@ impl ScryState {
                 seq,
                 window_id: record.id,
             });
+            self.refocus_topmost();
         }
+    }
+
+    /// Moves keyboard focus to `surface`; [`SeatHandler::focus_changed`]
+    /// mirrors the owning client into the seat's selection focus.
+    fn focus_surface(&mut self, surface: Option<WlSurface>) {
+        let serial = SERIAL_COUNTER.next_serial();
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, surface, serial);
+        }
+    }
+
+    /// After a window leaves, focus falls back deterministically to the
+    /// topmost remaining mapped toplevel (or to nothing).
+    fn refocus_topmost(&mut self) {
+        let topmost = self
+            .space
+            .elements()
+            .last()
+            .and_then(|window| window.wl_surface().map(|s| s.into_owned()));
+        self.focus_surface(topmost);
     }
 
     /// A surface owned by a toplevel role disappeared (defensive cleanup for
@@ -601,10 +662,88 @@ impl ScryState {
                     value: frame,
                 }));
             }
+            Command::SetFrameClockMode { mode, reply } => {
+                self.frame_clock.set_mode(mode);
+                self.seq += 1;
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: (),
+                }));
+            }
+            Command::SetSelection {
+                kind,
+                mime,
+                data,
+                reply,
+            } => {
+                // `set_selection` emits the ClipboardUpdated event, which
+                // already bumps `seq`; the reply reports the applied state.
+                self.set_selection(kind, mime, data);
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: (),
+                }));
+            }
+            Command::StepFrameClock { duration, reply } => {
+                let time = self.frame_clock.step(duration);
+                self.send_frames(time);
+                self.seq += 1;
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: (),
+                }));
+            }
+            Command::ClearSelection { kind, reply } => {
+                self.clear_selection(kind);
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value: (),
+                }));
+            }
+            Command::ReadSelection { kind, mime, reply } => {
+                self.read_selection(kind, mime, reply);
+            }
+            Command::SelectionMimeTypes { kind, reply } => {
+                let value = self.selection_mime_types(kind);
+                let _ = reply.send(Ok(Reply {
+                    seq: self.seq,
+                    value,
+                }));
+            }
         }
         // Commands may have produced protocol traffic (configures, closes).
         if let Err(err) = self.display_handle.flush_clients() {
             debug!("failed to flush clients after command: {err}");
+        }
+    }
+
+    /// Fires every pending `wl_surface.frame` callback on all mapped
+    /// windows' surface trees, stamped with virtual presentation `time`.
+    ///
+    /// The throttle of [`Duration::ZERO`] and a scanout closure reporting
+    /// our one virtual output mean callbacks fire unconditionally, whatever
+    /// the surface's occlusion state — the right semantics for a headless
+    /// compositor.
+    fn send_frames(&mut self, time: Duration) {
+        for record in &self.windows {
+            record
+                .window
+                .send_frame(&self.default_output, time, Some(Duration::ZERO), |_, _| {
+                    Some(self.default_output.clone())
+                });
+        }
+        // Frame callbacks are protocol traffic; flush so clients observe
+        // them promptly rather than on the next unrelated dispatch.
+        if let Err(err) = self.display_handle.flush_clients() {
+            debug!("failed to flush clients after frame callbacks: {err}");
+        }
+    }
+
+    /// One frame-clock tick: in realtime mode advances the virtual clock and
+    /// fires pending frame callbacks; while paused, holds them.
+    fn frame_clock_tick(&mut self) {
+        if let Some(time) = self.frame_clock.tick() {
+            self.send_frames(time);
         }
     }
 
@@ -721,12 +860,21 @@ impl SeatHandler for ScryState {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
+
+    /// Selection focus follows keyboard focus: the client owning the focused
+    /// surface is offered both the clipboard and the primary selection.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let client = focused.and_then(|surface| surface.client());
+        set_data_device_focus(&self.display_handle, seat, client.clone());
+        set_primary_focus(&self.display_handle, seat, client);
+    }
 }
 
 smithay::delegate_compositor!(ScryState);
 smithay::delegate_shm!(ScryState);
 smithay::delegate_xdg_shell!(ScryState);
 smithay::delegate_output!(ScryState);
+smithay::delegate_seat!(ScryState);
 
 // -- event loop entry point ---------------------------------------------------
 
@@ -740,14 +888,14 @@ pub(crate) fn run(
     command_rx: Channel<Command>,
     init: ReplySender<std::result::Result<(), String>>,
 ) {
-    let mut event_loop: EventLoop<ScryState> = match EventLoop::try_new().map_err(|e| e.to_string())
-    {
-        Ok(event_loop) => event_loop,
-        Err(err) => {
-            let _ = init.send(Err(err));
-            return;
-        }
-    };
+    let mut event_loop: EventLoop<'static, ScryState> =
+        match EventLoop::try_new().map_err(|e| e.to_string()) {
+            Ok(event_loop) => event_loop,
+            Err(err) => {
+                let _ = init.send(Err(err));
+                return;
+            }
+        };
     let loop_handle = event_loop.handle();
 
     let display: Display<ScryState> = match Display::new().map_err(|e| e.to_string()) {
@@ -758,7 +906,11 @@ pub(crate) fn run(
         }
     };
     let display_handle = display.handle();
-    let mut state = ScryState::new(&display_handle, event_loop.get_signal());
+    let mut state = ScryState::new(
+        &display_handle,
+        loop_handle.clone(),
+        event_loop.get_signal(),
+    );
 
     let setup = (|| -> std::result::Result<(), String> {
         // Commands arriving from CompositorHandle instances.
@@ -791,6 +943,16 @@ pub(crate) fn run(
                     Ok(PostAction::Continue)
                 },
             )
+            .map_err(|e| e.to_string())?;
+
+        // The virtual frame clock: fires every FRAME_INTERVAL (~60Hz). In
+        // realtime mode each tick fires pending wl_surface.frame callbacks;
+        // while paused the tick is a no-op, keeping mode switches cheap.
+        loop_handle
+            .insert_source(Timer::from_duration(FRAME_INTERVAL), |_, _, state| {
+                state.frame_clock_tick();
+                TimeoutAction::ToDuration(FRAME_INTERVAL)
+            })
             .map_err(|e| e.to_string())?;
 
         // The wayland display itself: dispatch client requests when readable.

@@ -9,8 +9,10 @@
 //! │   CompositorHandle   │ commands │  smithay protocol state       │
 //! │   · windows()        │─────────▶│  · wl_compositor/subcompositor│
 //! │   · resize/close     │          │  · wl_shm                     │
-//! │   · shutdown()       │          │  · xdg_shell (toplevel/popup) │
-//! │                      │          │  · wl_output (virtual)        │
+//! │   · set/read         │          │  · xdg_shell (toplevel/popup) │
+//! │     selection        │          │  · wl_output (virtual)        │
+//! │   · shutdown()       │          │  · wl_seat + clipboard        │
+//! │                      │          │    (wl_data_device + primary) │
 //! │   subscribe()        │  events  │  · Space + PopupManager       │
 //! │   ◀───────────────── │◀─────────│  · SO_PEERCRED pid registry   │
 //! └──────────────────────┘          └────────────▲─────────────────┘
@@ -42,16 +44,20 @@
 //! # }
 //! ```
 
+mod clipboard;
 mod compositor;
 mod error;
 mod event;
 mod frame;
+mod frame_clock;
 mod handle;
 mod render;
 mod state;
 
+pub use clipboard::SelectionKind;
 pub use compositor::Compositor;
 pub use error::{Error, Result};
 pub use event::{CompositorEvent, PopupInfo, Rect, Seq, SurfaceId, WindowId, WindowInfo};
 pub use frame::Frame;
+pub use frame_clock::FrameClockMode;
 pub use handle::{CompositorHandle, Reply};
