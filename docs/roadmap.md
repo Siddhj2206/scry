@@ -162,9 +162,11 @@ takeover.
 
 - `rmcp 3.11` server over stdio and streamable HTTP (`axum 0.8`)
 - Full Control API surface exposed as MCP tools for AI agents
-- Optional `clientInfo`-aware tool surface: typed tools for code-mode clients,
-  falling back to a compact `status` / `workspaces` / `execute` escape hatch
-  where a full typed surface does not fit
+- Model the MCP UX and token-efficiency patterns closely on `anomalyco/browse`
+  (thin stateless stdio/HTTP proxy over the daemon, `clientInfo`-aware typed
+  tools vs. compact `status` / `workspaces` / `execute` escape hatch,
+  inspect → act → verify workflow guidance, bounded/redacted snapshots,
+  descriptive stale-ref errors, and diagnostic `status`)
 
 **Acceptance criteria**
 
@@ -172,9 +174,21 @@ takeover.
   AT-SPI tree, click a node, and capture the result.
 - Same flow works over the HTTP transport.
 
-## 4. Phase 2 — Live Browser Viewer, Human Takeover & Flight Recorder
+## 4. Phase 2 — Headless GPU, Live Browser Viewer, Human Takeover & Flight Recorder
 
-### M5 — Live streaming viewer
+### M5 — Optional GPU acceleration (`zwp_linux_dmabuf_v1`)
+
+- Headless EGL/GBM render-node path (`/dev/dri/renderD128`) with `llvmpipe`
+  software fallback and `zwp_linux_dmabuf_v1` import so GPU-first apps
+  (Chromium/Electron, Tauri/WebKitGTK, Firefox WebRender, Ghostty, wgpu)
+  render smoothly before live streaming and recording.
+- Strictly behind an opt-in Cargo feature (`dmabuf` / `renderer_gles`); the
+  `wl_shm`/`tiny-skia` path remains the default zero-GPU baseline for CI and
+  tests.
+- Acceptance: GPU-backed native Wayland apps map, render, and capture cleanly
+  when enabled, while default `cargo test` builds without GBM/EGL headers.
+
+### M6 — Live streaming viewer
 
 - Damaged-region / whole-workspace streaming over WebSocket / WebTransport to a
   minimal browser viewer.
@@ -184,7 +198,7 @@ takeover.
 - Acceptance: sub-100ms latency from commit to browser frame on localhost;
   viewer renders damage-only updates correctly.
 
-### M6 — Human-in-the-loop takeover
+### M7 — Human-in-the-loop takeover
 
 - Explicit three-state control machine:
   - **Agent Active** — agent drives input, human observes.
@@ -199,7 +213,7 @@ takeover.
 - Acceptance: takeover is atomic, visible in the viewer, and every transition
   is logged; agent receives the state summary on hand-back.
 
-### M7 — UI Flight Recorder
+### M8 — UI Flight Recorder
 
 - Compact session trace recording inputs, window-tree changes, AT-SPI actions,
   and dirty frames.
@@ -213,13 +227,7 @@ takeover.
 - Acceptance: a recorded session replays deterministically; traces are small
   enough to attach to test failures.
 
-## 5. Phase 3 — Ecosystem & Acceleration
-
-### M8 — Optional GPU acceleration
-
-- `dmabuf` import + hardware rendering path when `/dev/dri/renderD128` is
-  present. Strictly optional; the `wl_shm`/`tiny-skia` path remains the default
-  and the baseline for tests.
+## 5. Phase 3 — Ecosystem
 
 ### M9 — Optional rootless XWayland
 
