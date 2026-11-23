@@ -8,6 +8,8 @@ image = { version = "0.25", default-features = false, features = [
     "png",
     "webp",
 ] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 signal-hook = "0.3"
 smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
@@ -16,6 +18,15 @@ smithay = { version = "0.7", default-features = false, features = [
 tempfile = "3"
 thiserror = "2"
 tiny-skia = "0.12"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
