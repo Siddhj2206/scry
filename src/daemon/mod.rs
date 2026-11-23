@@ -39,6 +39,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Mutex, oneshot},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -269,6 +270,18 @@ async fn serve(
 /// connection; the socket writer is serialized behind a mutex so response
 /// frames stay whole lines.
 async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonContext>) {
+    // `SO_PEERCRED` identifies the connecting process; requests may also
+    // tag a `client_pid` param on top of it. Either signal cancels any
+    // in-flight blocking verb the request spawned.
+    let peer_pid = stream
+        .peer_cred()
+        .ok()
+        .and_then(|cred| cred.pid())
+        .map(|pid| pid as u32);
+    // Dropped the moment the read loop ends (EOF or error): every in-flight
+    // request on this connection observes cancellation.
+    let conn_cancel = CancellationToken::new();
+
     let (read, write) = stream.into_split();
     let writer = Arc::new(Mutex::new(write));
     let mut lines = BufReader::new(read);
@@ -288,8 +301,12 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonContext>) {
                 let frame = line.trim_end().to_string();
                 let ctx = ctx.clone();
                 let writer = writer.clone();
+                let conn = router::RequestContext {
+                    cancel: conn_cancel.clone(),
+                    peer_pid,
+                };
                 tokio::spawn(async move {
-                    let response = handle_frame(&frame, &ctx).await;
+                    let response = handle_frame(&frame, &ctx, conn).await;
                     if let Some(frame) = response {
                         write_frame(&writer, frame).await;
                     }
@@ -301,16 +318,21 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonContext>) {
             }
         }
     }
+    conn_cancel.cancel();
 }
 
 /// Parses and dispatches one request frame; `None` means the frame was a
 /// notification and gets no response.
-async fn handle_frame(frame: &str, ctx: &Arc<DaemonContext>) -> Option<String> {
+async fn handle_frame(
+    frame: &str,
+    ctx: &Arc<DaemonContext>,
+    conn: router::RequestContext,
+) -> Option<String> {
     match Request::parse(frame) {
         Ok(request) => {
             let respond = request.expects_response();
             let id = request.id.clone();
-            match router::dispatch(ctx, request).await {
+            match router::dispatch(ctx, request, conn).await {
                 Ok(result) if respond => {
                     Some(protocol::result_frame(&id.unwrap_or(Value::Null), result))
                 }

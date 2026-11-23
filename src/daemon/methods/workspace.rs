@@ -21,27 +21,29 @@ fn invalid_params(err: impl std::fmt::Display) -> ErrorResponse {
 pub const CREATE: MethodDef = MethodDef {
     name: "workspace_create",
     scope: Scope::Daemon,
-    run: |ctx, params, _ws| Box::pin(create(ctx, params)),
+    run: |call| Box::pin(create(call.ctx, call.params)),
 };
 
 /// `workspace_list` — every live workspace with its current seq.
 pub const LIST: MethodDef = MethodDef {
     name: "workspace_list",
     scope: Scope::Daemon,
-    run: |ctx, _params, _ws| Box::pin(list(ctx)),
+    run: |call| Box::pin(list(call.ctx)),
 };
 
 /// `workspace_close` — tear a workspace down (allowed on `readOnly`).
 pub const CLOSE: MethodDef = MethodDef {
     name: "workspace_close",
     scope: Scope::Workspace { mutating: false },
-    run: |ctx, _params, ws| {
+    run: |call| {
         Box::pin(async move {
-            let ws = ws.expect("workspace scope resolves a workspace");
+            let ws = call
+                .workspace
+                .expect("workspace scope resolves a workspace");
             // The Arc this handler holds keeps the record alive while
             // `close` removes it from the registry and tears down its
             // compositor.
-            ctx.registry.close(ws.id(), "client_request").await?;
+            call.ctx.registry.close(ws.id(), "client_request").await?;
             Ok(json!({ "closed": ws.id() }))
         })
     },

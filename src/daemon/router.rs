@@ -9,6 +9,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::daemon::{
     DaemonContext,
@@ -33,15 +34,40 @@ pub enum Scope {
 /// The future a handler returns.
 type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ErrorResponse>> + Send + 'a>>;
 
+/// Per-connection request context, shared by every request the connection
+/// spawns. Lets blocking verbs cancel when the caller goes away.
+#[derive(Clone)]
+pub struct RequestContext {
+    /// Cancelled when the connection's read loop ends (client disconnect).
+    pub cancel: CancellationToken,
+    /// `SO_PEERCRED` pid of the connecting process, when the platform
+    /// reports it.
+    pub peer_pid: Option<u32>,
+}
+
+/// Everything a verb handler needs for one request.
+pub struct Call {
+    /// Shared daemon state.
+    pub ctx: Arc<DaemonContext>,
+    /// The request's raw `params` value.
+    pub params: Value,
+    /// The resolved target workspace for workspace-scoped verbs.
+    pub workspace: Option<Arc<Workspace>>,
+    /// Cancelled when the client's socket disconnects mid-request.
+    /// Blocking verbs must treat this as immediate cancellation.
+    pub cancel: CancellationToken,
+    /// `SO_PEERCRED` pid of the connecting process, when reported.
+    pub peer_pid: Option<u32>,
+}
+
 /// One registered control verb.
 pub struct MethodDef {
     /// The JSON-RPC `method` name.
     pub name: &'static str,
     /// Dispatch scope (daemon-wide vs workspace-scoped + mutation flag).
     pub scope: Scope,
-    /// The handler: context, raw `params`, resolved workspace (for
-    /// workspace-scoped verbs).
-    pub run: fn(Arc<DaemonContext>, Value, Option<Arc<Workspace>>) -> HandlerFuture<'static>,
+    /// The handler for one request.
+    pub run: fn(Call) -> HandlerFuture<'static>,
 }
 
 /// All registered verbs. Follow-on milestones append their own entries.
@@ -52,19 +78,30 @@ pub const METHODS: &[MethodDef] = &[
     crate::daemon::methods::output::ADD,
     crate::daemon::methods::output::LIST,
     crate::daemon::methods::output::REMOVE,
+    crate::daemon::methods::waits::WAIT_FOR_WINDOW,
+    crate::daemon::methods::waits::WAIT_FOR_COMMIT,
+    crate::daemon::methods::waits::WAIT_FOR_IDLE,
 ];
 
 /// Dispatches one request to its verb and wraps the payload in the standard
 /// `command_id`/`seq` envelope.
-pub async fn dispatch(ctx: &Arc<DaemonContext>, request: Request) -> Result<Value, ErrorResponse> {
+///
+/// `conn` carries the connection-scoped cancellation token and peer pid so
+/// blocking verbs can abort when the caller disappears.
+pub async fn dispatch(
+    ctx: &Arc<DaemonContext>,
+    request: Request,
+    conn: RequestContext,
+) -> Result<Value, ErrorResponse> {
+    let Request { id, method, params } = request;
     let def = METHODS
         .iter()
-        .find(|def| def.name == request.method)
+        .find(|def| def.name == method)
         .ok_or_else(|| {
             ErrorResponse::with_data(
                 code::METHOD_NOT_FOUND,
-                format!("unknown method {:?}", request.method),
-                json!({"method": request.method}),
+                format!("unknown method {method:?}"),
+                json!({"method": method}),
             )
         })?;
 
@@ -73,7 +110,7 @@ pub async fn dispatch(ctx: &Arc<DaemonContext>, request: Request) -> Result<Valu
     let workspace = match def.scope {
         Scope::Daemon => None,
         Scope::Workspace { mutating } => {
-            let id = workspace_param(&request.params)?;
+            let id = workspace_param(&params)?;
             let ws = ctx.registry.get(&id)?;
             if mutating && ws.options().read_only {
                 return Err(ErrorResponse::with_data(
@@ -91,10 +128,17 @@ pub async fn dispatch(ctx: &Arc<DaemonContext>, request: Request) -> Result<Valu
         }
     };
 
-    let payload = (def.run)(ctx.clone(), request.params, workspace.clone()).await?;
+    let payload = (def.run)(Call {
+        ctx: ctx.clone(),
+        params,
+        workspace: workspace.clone(),
+        cancel: conn.cancel,
+        peer_pid: conn.peer_pid,
+    })
+    .await?;
     let fallback_seq = workspace.as_ref().map(|ws| ws.seq());
     Ok(crate::daemon::protocol::envelope(
-        request.id.unwrap_or(Value::Null),
+        id.unwrap_or(Value::Null),
         payload,
         fallback_seq,
     ))
